@@ -32,7 +32,9 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
+GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
+GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 
 API_URLS = (
     "https://api.steampowered.com/ISteamUser/GetPlayerBans/v1/",
@@ -280,6 +282,31 @@ class DpapiKeyStore:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
+
+
+def version_key(value: str) -> tuple[int, int, int] | None:
+    """把 GitHub tag 或界面版本转换为可比较的三段语义化版本。"""
+    match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', str(value or '').strip())
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def login_elapsed_label(last_logout_at: str | None, last_login_at: str | None, now: datetime | None = None) -> str:
+    """显示由本工具记录的退出后经过时间；72 小时后改为显示上次登录日期。"""
+    if not last_login_at:
+        return '从未登录'
+    if not last_logout_at:
+        return '当前登录中'
+    try:
+        logged_out = datetime.strptime(last_logout_at, '%Y-%m-%d %H:%M:%S %z')
+    except ValueError:
+        return '登录时间未知'
+    reference = now or datetime.now(logged_out.tzinfo)
+    elapsed_hours = max(0, int((reference - logged_out).total_seconds() // 3600))
+    if elapsed_hours < 72:
+        return f'距上次登录 {elapsed_hours} 小时'
+    return f"上次登录：{logged_out.strftime('%Y-%m-%d')}"
 
 
 def normalize_steam_id(value: Any) -> str:
@@ -575,14 +602,25 @@ class AccountStore:
                 checked_at TEXT,
                 status TEXT NOT NULL DEFAULT '未查询',
                 query_error TEXT NOT NULL DEFAULT '',
-                password_enc TEXT NOT NULL DEFAULT ''
+                password_enc TEXT NOT NULL DEFAULT '',
+                last_login_at TEXT,
+                last_logout_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_accounts_steam_id ON accounts(steam_id);
             CREATE INDEX IF NOT EXISTS idx_accounts_name ON accounts(account_name COLLATE NOCASE);
+            CREATE TABLE IF NOT EXISTS app_state (
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT NOT NULL
+            );
             """)
         existing = {row[1] for row in connection.execute('PRAGMA table_info(accounts)')}
         if 'password_enc' not in existing:
             connection.execute("ALTER TABLE accounts ADD COLUMN password_enc TEXT NOT NULL DEFAULT ''")
+        if 'last_login_at' not in existing:
+            connection.execute("ALTER TABLE accounts ADD COLUMN last_login_at TEXT")
+        if 'last_logout_at' not in existing:
+            connection.execute("ALTER TABLE accounts ADD COLUMN last_logout_at TEXT")
+        connection.execute('CREATE INDEX IF NOT EXISTS idx_accounts_last_login ON accounts(last_login_at DESC)')
         connection.commit()
 
     @staticmethod
@@ -643,10 +681,56 @@ class AccountStore:
         total = int(self.connection.execute(f'SELECT COUNT(*) FROM accounts {where}').fetchone()[0])
         rows = self.connection.execute(
             f'SELECT * FROM accounts {where}'
-            ' ORDER BY account_name COLLATE NOCASE, steam_id LIMIT ? OFFSET ?',
+            ' ORDER BY CASE WHEN last_login_at IS NULL OR last_login_at = \'\' THEN 1 ELSE 0 END,'
+            ' last_login_at DESC, account_name COLLATE NOCASE, steam_id LIMIT ? OFFSET ?',
             (limit, offset),
         ).fetchall()
         return rows, total
+
+    def active_account_id(self) -> int | None:
+        """返回上一次由本工具成功登录、且尚未在下一次切换中退出的账号。"""
+        row = self.connection.execute(
+            "SELECT state_value FROM app_state WHERE state_key='active_account_id'"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            account_id = int(row['state_value'])
+        except (TypeError, ValueError):
+            account_id = 0
+        exists = self.connection.execute('SELECT 1 FROM accounts WHERE id=?', (account_id,)).fetchone()
+        if exists is not None:
+            return account_id
+        with self.connection:
+            self.connection.execute("DELETE FROM app_state WHERE state_key='active_account_id'")
+        return None
+
+    def mark_account_logged_out(self, account_id: int, logged_out_at: str | None = None) -> None:
+        """记录本工具已成功退出该账号的时刻，并在必要时清除活跃会话。"""
+        account_id = int(account_id)
+        with self.connection:
+            self.connection.execute(
+                'UPDATE accounts SET last_logout_at=? WHERE id=?',
+                (logged_out_at or utc_now(), account_id),
+            )
+            self.connection.execute(
+                "DELETE FROM app_state WHERE state_key='active_account_id' AND state_value=?",
+                (str(account_id),),
+            )
+
+    def mark_account_logged_in(self, account_id: int, logged_in_at: str | None = None) -> None:
+        """记录成功发起的客户端登录；该字段也是列表的最近登录排序依据。"""
+        account_id = int(account_id)
+        with self.connection:
+            self.connection.execute(
+                'UPDATE accounts SET last_login_at=?, last_logout_at=NULL WHERE id=?',
+                (logged_in_at or utc_now(), account_id),
+            )
+            self.connection.execute(
+                "INSERT INTO app_state (state_key, state_value) VALUES ('active_account_id', ?)"
+                " ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value",
+                (str(account_id),),
+            )
 
     def account_objects(self, account_ids: Iterable[int]) -> list[Account]:
         ids = [int(item) for item in account_ids]
@@ -966,8 +1050,12 @@ class AccountStore:
         steam_id = normalize_steam_id(steam_id)
         existing = self.connection.execute('SELECT id FROM accounts WHERE steam_id=?', (steam_id,)).fetchone()
         if existing is not None and int(existing['id']) != int(account_id):
-            self.connection.execute('DELETE FROM accounts WHERE id=?', (int(account_id),))
-            self.connection.commit()
+            with self.connection:
+                self.connection.execute('DELETE FROM accounts WHERE id=?', (int(account_id),))
+                self.connection.execute(
+                    "DELETE FROM app_state WHERE state_key='active_account_id' AND state_value=?",
+                    (str(int(account_id)),),
+                )
             return False
         self.connection.execute('UPDATE accounts SET steam_id=? WHERE id=?', (steam_id, int(account_id)))
         self.connection.commit()
@@ -978,8 +1066,12 @@ class AccountStore:
         if not ids:
             return
         marks = ','.join('?' for _ in ids)
-        self.connection.execute(f'DELETE FROM accounts WHERE id IN ({marks})', ids)
-        self.connection.commit()
+        with self.connection:
+            self.connection.execute(f'DELETE FROM accounts WHERE id IN ({marks})', ids)
+            self.connection.execute(
+                f"DELETE FROM app_state WHERE state_key='active_account_id' AND state_value IN ({marks})",
+                [str(account_id) for account_id in ids],
+            )
 
     def clear_rejected_key_failures(self) -> int:
         """清理旧版把一次全局 401/403 误写到每一条账号上的状态。"""
@@ -1864,6 +1956,7 @@ class SteamBanApp:
         ("pick", "选择", 52),
         ("account_name", "账号标签", 150),
         ("steam_id", "SteamID64", 175),
+        ("login_elapsed", "上次登录", 155),
         ("vac", "VAC", 55),
         ("game_bans", "游戏封禁", 76),
         ("pubg", "PUBG 判断", 190),
@@ -1913,6 +2006,9 @@ class SteamBanApp:
         self.query_running = False
         self.import_running = False
         self.login_running = False
+        self.update_check_running = False
+        self.update_url = ''
+        self.update_version = ''
         self.query_completed = 0
         self.query_total = 0
         self.import_cancel_event = None
@@ -1922,6 +2018,8 @@ class SteamBanApp:
         self._build_ui()
         self.refresh_table()
         self.root.after(120, self._drain_events)
+        self._schedule_login_timer_refresh()
+        self.root.after(800, self.check_for_updates)
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -1987,6 +2085,14 @@ class SteamBanApp:
             style="HeaderSubtitle.TLabel",
         ).pack(anchor="w", pady=(4, 0))
         ttk.Label(header, text=f"Windows 桌面版 · v{APP_VERSION}", style="Badge.TLabel").pack(side="right", anchor="n", pady=(6, 0))
+        self.update_button = ttk.Button(
+            header,
+            text="检查更新",
+            command=self.check_for_updates,
+            bootstyle="info-outline",
+            width=12,
+        )
+        self.update_button.pack(side="right", anchor="n", padx=(0, 10), pady=(6, 0))
 
         key_card = ttk.Frame(outer, style="Card.TFrame", padding=UiMetrics.CARD_PADDING)
         key_card.pack(fill="x", pady=(0, UiMetrics.SECTION_GAP))
@@ -2200,6 +2306,55 @@ class SteamBanApp:
         self.key_state_var.set("仅本次运行")
         self.status_var.set("已清除本机加密保存的 API Key。")
 
+    def _schedule_login_timer_refresh(self) -> None:
+        """小时数会跨整点变化；下一整点刷新列表即可，无须高频重绘大账号库。"""
+        now = datetime.now()
+        seconds_to_next_hour = max(1, 3600 - now.minute * 60 - now.second)
+        self.root.after(seconds_to_next_hour * 1000, self._refresh_login_timers)
+
+    def _refresh_login_timers(self) -> None:
+        self.refresh_table()
+        self._schedule_login_timer_refresh()
+
+    def check_for_updates(self) -> None:
+        """在后台读取 GitHub Latest Release；只提醒和打开下载页，不下载或替换正在运行的 EXE。"""
+        if self.update_url:
+            self._open_update_page()
+            return
+        if self.update_check_running:
+            return
+        self.update_check_running = True
+        self.update_button.configure(text="正在检查…", state="disabled")
+        threading.Thread(target=self._update_check_worker, daemon=True).start()
+
+    def _update_check_worker(self) -> None:
+        try:
+            request = Request(
+                GITHUB_LATEST_RELEASE_API,
+                headers={'Accept': 'application/vnd.github+json', 'User-Agent': f'PUBG-Auto-Login/{APP_VERSION}'},
+                method='GET',
+            )
+            with urlopen(request, timeout=8) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+            tag_name = str(payload.get('tag_name') or '')
+            release_version = version_key(tag_name)
+            current_version = version_key(APP_VERSION)
+            if release_version is None or current_version is None:
+                raise ValueError('GitHub Release 的版本号不是 X.Y.Z 格式。')
+            if release_version > current_version:
+                release_url = str(payload.get('html_url') or f'https://github.com/{GITHUB_REPOSITORY}/releases/tag/{tag_name}')
+                self.events.put(('update_available', (tag_name.lstrip('v'), release_url)))
+            else:
+                self.events.put(('update_current', None))
+        except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+            self.events.put(('update_check_failed', str(exc)))
+
+    def _open_update_page(self) -> None:
+        if not self.update_url:
+            return
+        webbrowser.open(self.update_url)
+        self.status_var.set(f"已打开 GitHub 的 v{self.update_version} 下载页面。")
+
     def open_steam_login(self, account_id: int | None = None) -> None:
         """用本机保存的账号密码自动登录指定账号；不传就登录列表里选中的那个。"""
         if self.login_running:
@@ -2237,13 +2392,14 @@ class SteamBanApp:
             webbrowser.open("https://steamcommunity.com/login/home/")
             self.status_var.set("未找到本机 Steam 客户端，已打开 Steam 官方登录页。")
             return
+        previous_account_id = self.store.active_account_id()
         self.login_running = True
         self._set_controls(False)
         self.status_var.set(f"正在退出当前 Steam 并登录账号 {account_name}，请稍候…")
         try:
             threading.Thread(
                 target=self._steam_login_worker,
-                args=(steam_exe, account_name, account.steam_id, password),
+                args=(steam_exe, account_name, account.steam_id, password, account.account_id, previous_account_id),
                 daemon=True,
             ).start()
         except RuntimeError as exc:
@@ -2252,12 +2408,23 @@ class SteamBanApp:
             self.status_var.set("无法启动自动登录。")
             messagebox.showerror(APP_NAME, f"无法启动自动登录线程：{exc}", parent=self.root)
 
-    def _steam_login_worker(self, steam_exe: str, account_name: str, steam_id: str, password: str) -> None:
+    def _steam_login_worker(
+        self,
+        steam_exe: str,
+        account_name: str,
+        steam_id: str,
+        password: str,
+        account_id: int | None = None,
+        previous_account_id: int | None = None,
+    ) -> None:
         """后台线程：结束当前 Steam，写入自动登录配置，再带账号密码启动客户端。"""
         try:
             if not steam_login.shutdown_steam(steam_exe):
                 self.events.put(("steam_login_failed", "无法结束当前 Steam 进程，请手动退出 Steam 后重试。"))
                 return
+            if previous_account_id is not None:
+                # 仅在 Steam 已确实退出后记时；主线程收到事件后写库，避免跨线程共用 SQLite 连接。
+                self.events.put(("steam_logout", (int(previous_account_id), utc_now())))
             tweaks = []
             if STEAM_ID_PATTERN.fullmatch(steam_id):
                 steam_login.write_auto_login(steam_exe, steam_id, account_name)
@@ -2278,8 +2445,12 @@ class SteamBanApp:
         self.events.put(
             (
                 "steam_login_done",
-                f"账号 {account_name}：{login_result}{applied}。若 Valve 要求 Steam Guard 验证码，请在客户端里完成一次验证；"
-                "该账号在本机验证过一次后，之后即可直接自动登录。",
+                (
+                    account_id,
+                    utc_now(),
+                    f"账号 {account_name}：{login_result}{applied}。若 Valve 要求 Steam Guard 验证码，请在客户端里完成一次验证；"
+                    "该账号在本机验证过一次后，之后即可直接自动登录。",
+                ),
             )
         )
 
@@ -2413,6 +2584,7 @@ class SteamBanApp:
             "■" if row["id"] in self.checked_ids else "□",
             row["account_name"],
             row["steam_id"] if STEAM_ID_PATTERN.fullmatch(row["steam_id"] or "") else "未解析（查询时自动获取）",
+            login_elapsed_label(row["last_logout_at"], row["last_login_at"]),
             bool_label(row["vac_banned"]),
             row["game_bans"] if row["game_bans"] is not None else "—",
             row["pubg_assessment"] or "—",
@@ -2840,7 +3012,23 @@ class SteamBanApp:
             while processed < MAX_UI_EVENTS_PER_TICK:
                 kind, payload = self.events.get_nowait()
                 processed += 1
-                if kind == "result_batch":
+                if kind == "update_available":
+                    version, url = payload
+                    self.update_check_running = False
+                    self.update_version = version
+                    self.update_url = url
+                    self.update_button.configure(
+                        text=f"下载 v{version}", command=self._open_update_page, state="normal"
+                    )
+                    if not (self.query_running or self.import_running or self.login_running):
+                        self.status_var.set(f"发现新版本 v{version}，点击右上角“下载 v{version}”获取更新。")
+                elif kind == "update_current":
+                    self.update_check_running = False
+                    self.update_button.configure(text="检查更新", command=self.check_for_updates, state="normal")
+                elif kind == "update_check_failed":
+                    self.update_check_running = False
+                    self.update_button.configure(text="检查更新", command=self.check_for_updates, state="normal")
+                elif kind == "result_batch":
                     self.store.save_results_batch(payload)
                 elif kind == "query_progress":
                     completed, total = payload
@@ -2897,10 +3085,18 @@ class SteamBanApp:
                     self._set_controls(not (self.query_running or self.login_running))
                     self.status_var.set("导入失败。")
                     messagebox.showerror(APP_NAME, f"无法导入文件：{payload}", parent=self.root)
+                elif kind == "steam_logout":
+                    account_id, logged_out_at = payload
+                    self.store.mark_account_logged_out(account_id, logged_out_at)
+                    changed = True
                 elif kind == "steam_login_done":
+                    account_id, logged_in_at, message = payload
                     self.login_running = False
+                    if account_id is not None:
+                        self.store.mark_account_logged_in(account_id, logged_in_at)
                     self._set_controls(not (self.query_running or self.import_running))
-                    self.status_var.set(payload)
+                    self.status_var.set(message)
+                    changed = True
                 elif kind == "steam_login_failed":
                     self.login_running = False
                     self._set_controls(not (self.query_running or self.import_running))
@@ -2928,6 +3124,12 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
+    assert version_key("v3.1.0") == (3, 1, 0)
+    assert version_key("3.1") is None
+    fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
+    assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
+    assert login_elapsed_label("2026-09-19 12:00:00 +0800", "2026-09-19 11:00:00 +0800", fixed_now) == "上次登录：2026-09-19"
+    assert login_elapsed_label(None, "2026-09-22 11:00:00 +0800", fixed_now) == "当前登录中"
     try:
         normalize_steam_id("123")
         raise AssertionError("Invalid SteamID64 was accepted")
@@ -2972,6 +3174,24 @@ def run_self_test() -> None:
         assert [row[0] for row in economy_store.export_account_rows(None, "risk")] == ["库存限制"]
         assert list(economy_store.export_account_rows(None, "safe")) == []
         economy_store.close()
+
+        # 成功登录过的账号排在前面，按最近成功登录时间倒序；退出时再开始累计显示时长。
+        activity_store = AccountStore(root / "activity.sqlite3")
+        older_id = activity_store.upsert_account("较早登录", "76561198000000011", "")
+        newer_id = activity_store.upsert_account("最近登录", "76561198000000012", "")
+        activity_store.mark_account_logged_in(older_id, "2026-09-20 08:00:00 +0800")
+        activity_store.mark_account_logged_out(older_id, "2026-09-20 10:00:00 +0800")
+        activity_store.mark_account_logged_in(newer_id, "2026-09-21 08:00:00 +0800")
+        activity_rows, activity_total = activity_store.list_accounts_page(0, 10)
+        assert activity_total == 2
+        assert [row["account_name"] for row in activity_rows] == ["最近登录", "较早登录"]
+        assert activity_store.active_account_id() == newer_id
+        assert login_elapsed_label(
+            activity_rows[1]["last_logout_at"], activity_rows[1]["last_login_at"], fixed_now
+        ) == "距上次登录 50 小时"
+        activity_store.mark_account_logged_out(newer_id, "2026-09-22 11:00:00 +0800")
+        assert activity_store.active_account_id() is None
+        activity_store.close()
 
         fixture = root / "large_fixture.csv"
         with fixture.open("w", encoding="utf-8-sig", newline="") as file:
