@@ -1,7 +1,7 @@
 """Steam 封禁批量查询器（原生 Windows 桌面版）。
 
-只使用 SteamID64 与用户自行提供的 Steam Web API Key 查询 Steam 的公开封禁字段。
-不会保存或上传 Steam 账号密码，也不执行 Steam 登录、启动游戏或凭据自动化。
+用 SteamID64 和用户自己申请的 Steam Web API Key 查询 Steam 的公开封禁字段；
+账号、密码与 Key 只通过 Windows DPAPI 加密保存在本机，不会上传到任何服务器。
 """
 from __future__ import annotations
 
@@ -33,17 +33,31 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.1.4"
+APP_VERSION = "3.1.5"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
 APP_DATA_FOLDER_NAME = "PUBG-Auto-Login"
 ACCOUNT_DATABASE_FILENAME = "steam_ban_accounts.sqlite3"
 KEY_SETTINGS_FILENAME = "steam_ban_settings.json"
-LEGACY_SCAN_MARKER_FILENAME = "legacy-data-scan-v3.1.4.done"
+LEGACY_SCAN_MARKER_FILENAME = "legacy-data-scan.json"
 LEGACY_SCAN_SKIP_DIRECTORY_NAMES = frozenset({
     '.git', '.npm', '.nuget', '.cache', 'node_modules', 'temp', 'inetcache', 'crashdumps', 'packages',
 })
+# 用户目录里这些是 Windows 为兼容旧程序保留的链接（Application Data → AppData 等），跟着走只会重复扫一遍。
+LEGACY_PROFILE_SKIP_DIRECTORY_NAMES = LEGACY_SCAN_SKIP_DIRECTORY_NAMES | {
+    'application data', 'local settings', 'my documents', 'nethood', 'printhood',
+    'recent', 'sendto', 'templates', 'cookies', 'start menu',
+}
+# 非系统盘上用户可能把工具放在任意两层目录里；系统目录不必进。
+LEGACY_DRIVE_SKIP_DIRECTORY_NAMES = LEGACY_SCAN_SKIP_DIRECTORY_NAMES | {
+    'windows', 'program files', 'program files (x86)', 'programdata', '$recycle.bin',
+    'system volume information', 'recovery', 'perflogs', 'msocache', 'config.msi', 'appdata',
+    'intel', 'amd', 'nvidia', 'drivers',
+}
+LEGACY_DRIVE_SCAN_MAX_DEPTH = 2
+LEGACY_SCAN_MAX_DIRECTORIES = 40000
+LEGACY_SCAN_MAX_SECONDS = 90.0
 
 API_URLS = (
     "https://api.steampowered.com/ISteamUser/GetPlayerBans/v1/",
@@ -317,67 +331,229 @@ def legacy_data_directories(install_directory: Path, home_directory: Path | None
     return unique
 
 
-def is_account_database(path: Path) -> bool:
-    """只接受包含 accounts 表的本软件账号库，避免误迁移同名的无关 SQLite 文件。"""
+def account_database_stats(path: Path) -> tuple[int, int] | None:
+    """返回账号库的 (账号数, 已保存密码数)；不是本软件的账号库时返回 None。"""
     if not path.is_file():
-        return False
+        return None
     try:
         connection = sqlite3.connect(f'{path.resolve().as_uri()}?mode=ro', uri=True)
-        try:
-            return connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'"
-            ).fetchone() is not None
-        finally:
-            connection.close()
     except (OSError, sqlite3.Error):
-        return False
+        return None
+    try:
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'"
+        ).fetchone() is None:
+            return None
+        total = connection.execute('SELECT COUNT(*) FROM accounts').fetchone()[0]
+        # 老版本的表可能还没有密码列，这类库仍然可用（只是没有密码），不能当成"不是账号库"。
+        column_names = {row[1] for row in connection.execute('PRAGMA table_info(accounts)')}
+        with_password = 0
+        if 'password_enc' in column_names:
+            with_password = connection.execute(
+                "SELECT COUNT(*) FROM accounts WHERE password_enc IS NOT NULL AND password_enc <> ''"
+            ).fetchone()[0]
+        return int(total), int(with_password)
+    except (OSError, sqlite3.Error):
+        return None
+    finally:
+        connection.close()
+
+
+def is_account_database(path: Path) -> bool:
+    """只接受包含 accounts 表的本软件账号库，避免误迁移同名的无关 SQLite 文件。"""
+    return account_database_stats(path) is not None
+
+
+def candidate_rank(path: Path) -> tuple[int, int, float]:
+    """账号多、密码全、更新得晚的旧库更完整。"""
+    accounts, with_password = account_database_stats(path) or (0, 0)
+    try:
+        modified = path.stat().st_mtime
+    except OSError:
+        modified = 0.0
+    return accounts, with_password, modified
+
+
+def best_candidate(candidates: Iterable[Path]) -> Path | None:
+    """按 (账号数, 密码数, 修改时间) 选一份最完整的账号库。"""
+    ranked = [(candidate_rank(path), path) for path in candidates]
+    if not ranked:
+        return None
+    return max(ranked, key=lambda item: item[0])[1]
+
+
+def find_account_databases(
+    directory: Path,
+    *,
+    max_depth: int | None = None,
+    excluded_directories: Iterable[Path] = (),
+    skip_directory_names: frozenset[str] = LEGACY_SCAN_SKIP_DIRECTORY_NAMES,
+    max_directories: int = LEGACY_SCAN_MAX_DIRECTORIES,
+    max_seconds: float = LEGACY_SCAN_MAX_SECONDS,
+) -> list[Path]:
+    """只读查找目录下固定文件名的本软件账号库；max_depth 为 None 表示一直往下找。
+
+    目录数与耗时都有上限，避免在任何一台机器上长时间占用磁盘。
+    """
+    base = Path(directory)
+    try:
+        base = base.resolve()
+    except OSError:
+        return []
+    if not base.is_dir():
+        return []
+    excluded = set()
+    for path in excluded_directories:
+        try:
+            excluded.add(Path(path).resolve())
+        except OSError:
+            continue
+    depth_limit = max_depth if max_depth is not None else 1 << 30
+    deadline = time.monotonic() + max_seconds
+    found: list[Path] = []
+    visited = 0
+    stack: list[tuple[Path, int]] = [(base, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if current in excluded:
+            continue
+        visited += 1
+        if visited > max_directories or time.monotonic() > deadline:
+            break
+        try:
+            with os.scandir(current) as entries:
+                children = list(entries)
+        except OSError:
+            continue
+        for entry in children:
+            try:
+                if entry.is_dir():
+                    if depth < depth_limit and entry.name.casefold() not in skip_directory_names:
+                        stack.append((Path(entry.path), depth + 1))
+                elif entry.name == ACCOUNT_DATABASE_FILENAME and account_database_stats(Path(entry.path)) is not None:
+                    found.append(Path(entry.path))
+            except OSError:
+                continue
+    return found
+
+
+def fixed_drive_roots() -> list[Path]:
+    """返回本机固定磁盘的根目录（跳过光驱、网络盘和可移动盘）。"""
+    try:
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    except (AttributeError, OSError):
+        return []
+    roots: list[Path] = []
+    for index in range(26):
+        if not bitmask & (1 << index):
+            continue
+        root = f'{chr(65 + index)}:\\'
+        try:
+            if ctypes.windll.kernel32.GetDriveTypeW(root) != 3:   # DRIVE_FIXED
+                continue
+        except (AttributeError, OSError):
+            continue
+        candidate = Path(root)
+        if candidate.is_dir():
+            roots.append(candidate)
+    return roots
+
+
+def collect_legacy_account_databases(
+    install_directory: Path,
+    home_directory: Path | None = None,
+    *,
+    deep: bool = False,
+    excluded_directories: Iterable[Path] = (),
+) -> list[Path]:
+    """收集可能的旧版账号库：先看常见位置，deep=True 时再找用户目录和所有固定磁盘。"""
+    home = home_directory or Path.home()
+    candidates: list[Path] = []
+    for directory in legacy_data_directories(install_directory, home):
+        direct_candidate = directory / ACCOUNT_DATABASE_FILENAME
+        if account_database_stats(direct_candidate) is not None:
+            candidates.append(direct_candidate)
+        try:
+            child_directories = [child for child in directory.iterdir() if child.is_dir()]
+        except OSError:
+            continue
+        for child in child_directories:
+            nested_candidate = child / ACCOUNT_DATABASE_FILENAME
+            if account_database_stats(nested_candidate) is not None:
+                candidates.append(nested_candidate)
+    if deep:
+        candidates.extend(find_account_databases(
+            home,
+            excluded_directories=excluded_directories,
+            skip_directory_names=LEGACY_PROFILE_SKIP_DIRECTORY_NAMES,
+        ))
+        for root in fixed_drive_roots():
+            candidates.extend(find_account_databases(
+                root,
+                max_depth=LEGACY_DRIVE_SCAN_MAX_DEPTH,
+                excluded_directories=excluded_directories,
+                skip_directory_names=LEGACY_DRIVE_SKIP_DIRECTORY_NAMES,
+            ))
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            continue
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
 
 
 def find_legacy_account_database(install_directory: Path, home_directory: Path | None = None) -> Path | None:
-    """从旧版默认目录及其一级子目录中选择最近更新的一份账号库。"""
-    candidates: list[Path] = []
-    for directory in legacy_data_directories(install_directory, home_directory):
-        direct_candidate = directory / ACCOUNT_DATABASE_FILENAME
-        if is_account_database(direct_candidate):
-            candidates.append(direct_candidate)
-        try:
-            child_directories = (child for child in directory.iterdir() if child.is_dir())
-            candidates.extend(
-                child / ACCOUNT_DATABASE_FILENAME
-                for child in child_directories
-                if is_account_database(child / ACCOUNT_DATABASE_FILENAME)
-            )
-        except OSError:
-            continue
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    """从旧版默认目录及其一级子目录里挑一份最完整的账号库。"""
+    return best_candidate(collect_legacy_account_databases(install_directory, home_directory))
 
 
 def find_legacy_account_database_in_profile(
     home_directory: Path,
     excluded_directory: Path,
 ) -> Path | None:
-    """后台遍历当前 Windows 用户目录，只匹配并验证固定名称的旧版账号库。"""
-    excluded_directory = excluded_directory.resolve()
-    candidates: list[Path] = []
-    for current_directory, child_directories, filenames in os.walk(home_directory, topdown=True, onerror=lambda _error: None):
-        current_path = Path(current_directory).resolve()
-        if current_path == excluded_directory or excluded_directory in current_path.parents:
-            child_directories[:] = []
-            continue
-        child_directories[:] = [
-            name for name in child_directories
-            if name.casefold() not in LEGACY_SCAN_SKIP_DIRECTORY_NAMES
-        ]
-        if ACCOUNT_DATABASE_FILENAME not in filenames:
-            continue
-        candidate = current_path / ACCOUNT_DATABASE_FILENAME
-        if is_account_database(candidate):
-            candidates.append(candidate)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    """后台遍历当前 Windows 用户目录，只匹配固定名称并验证是本软件的账号库。"""
+    return best_candidate(find_account_databases(
+        home_directory,
+        excluded_directories=[excluded_directory],
+        skip_directory_names=LEGACY_PROFILE_SKIP_DIRECTORY_NAMES,
+    ))
+
+
+def legacy_data_is_missing(stats: tuple[int, int]) -> bool:
+    """账号库是空的、或者一条密码都没保存时，值得去找旧版数据。"""
+    accounts, with_password = stats
+    return accounts == 0 or with_password == 0
+
+
+def legacy_migration_is_worthwhile(current: tuple[int, int], candidate: tuple[int, int]) -> bool:
+    """候选旧库是否比当前库更完整，值得自动替换（当前库有密码时一律不替换）。"""
+    current_accounts, current_passwords = current
+    candidate_accounts, candidate_passwords = candidate
+    if candidate_accounts == 0:
+        return False
+    if current_accounts == 0:
+        return True
+    if current_passwords == 0:
+        # 当前库丢了密码（例如被自动迁到了别的副本上）：账号不少于当前、且带密码的那份更好。
+        return candidate_passwords > 0 and candidate_accounts >= current_accounts
+    return False
+
+
+def best_migratable_legacy_database(
+    candidates: Iterable[Path],
+    current_stats: tuple[int, int],
+) -> Path | None:
+    """在候选里挑出最值得迁移的一份旧库。"""
+    eligible = [
+        path for path in candidates
+        if legacy_migration_is_worthwhile(current_stats, account_database_stats(path) or (0, 0))
+    ]
+    return best_candidate(eligible)
 
 
 def copy_sqlite_database(source_path: Path, destination_path: Path) -> None:
@@ -2144,19 +2320,31 @@ class SteamBanApp:
         migration_notice = ''
         automatic_migration_succeeded = False
         try:
-            # v3.1.2 及更早版本按 EXE 目录保存。首次使用共享目录时自动迁移最常见位置的旧数据。
-            if not self.database_path.exists():
-                legacy_database = find_legacy_account_database(self.install_dir)
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            # v3.1.2 及更早版本把数据放在 EXE 旁边。共享库还没有数据时（空库、或丢了全部密码），
+            # 先在常见位置找一份更完整的旧库；找不到再交给后台去用户目录和所有磁盘里找。
+            current_stats = account_database_stats(self.database_path) or (0, 0)
+            if legacy_data_is_missing(current_stats):
+                legacy_database = best_migratable_legacy_database(
+                    collect_legacy_account_databases(self.install_dir), current_stats
+                )
                 if legacy_database is not None:
+                    backup_path = self._backup_database_before_auto_migration()
                     migrated_database, migrated_settings = migrate_legacy_user_data(
-                        legacy_database.parent, self.data_dir
+                        legacy_database.parent,
+                        self.data_dir,
+                        replace_database=self.database_path.exists(),
+                        replace_settings=not self.settings_path.exists(),
                     )
                     if migrated_database:
                         automatic_migration_succeeded = True
                         suffix = '和已保存的 Key' if migrated_settings else ''
-                        migration_notice = f'已自动迁移旧版账号库{suffix}；以后更新会自动继承本机数据。'
-            self.data_dir.mkdir(parents=True, exist_ok=True)
-        except (OSError, sqlite3.Error) as exc:
+                        backup_suffix = f'（原库已备份为 {backup_path.name}）' if backup_path else ''
+                        migration_notice = (
+                            f'已自动继承旧版账号库{suffix}（来源：{legacy_database.parent}）{backup_suffix}；'
+                            '以后更新会自动使用这份数据。'
+                        )
+        except (OSError, sqlite3.Error, ValueError) as exc:
             migration_notice = f'未能自动迁移旧版数据：{exc}；可点击“迁移旧版数据”手动选择账号库。'
         self.store = AccountStore(self.database_path)
         cleared_key_failures = self.store.clear_rejected_key_failures()
@@ -2168,12 +2356,13 @@ class SteamBanApp:
             saved_api_key = None
             key_load_problem = str(exc)
 
-        # 旧版可能被解压到用户目录的更深层文件夹。扫描在后台运行，且每个用户只做一次。
+        # 旧版可能被解压到用户目录的更深层文件夹，甚至放在别的磁盘上。查找在后台运行，
+        # 同一个版本只做一次；只有当前库还缺数据（空库、或没有密码）时才会启动。
         self.legacy_scan_running = False
         self._should_scan_legacy_profile = (
             not automatic_migration_succeeded
-            and self.store.count_accounts() == 0
-            and not self.legacy_scan_marker_path.exists()
+            and legacy_data_is_missing(account_database_stats(self.database_path) or (0, 0))
+            and not self._legacy_scan_already_done()
         )
 
         self.api_key_var = StringVar(value=saved_api_key or "")
@@ -2919,24 +3108,58 @@ class SteamBanApp:
         threading.Thread(target=self._legacy_profile_scan_worker, daemon=True).start()
 
     def _legacy_profile_scan_worker(self) -> None:
+        """后台线程只负责找路径；真正的迁移回到 UI 线程完成。"""
         try:
-            legacy_database = find_legacy_account_database_in_profile(Path.home(), self.data_dir)
-            self.events.put(("legacy_data_found", str(legacy_database) if legacy_database else None))
+            current_stats = account_database_stats(self.database_path) or (0, 0)
+            candidates = collect_legacy_account_databases(
+                self.install_dir, deep=True, excluded_directories=[self.data_dir]
+            )
+            best = best_migratable_legacy_database(candidates, current_stats)
+            self.events.put(("legacy_data_found", str(best) if best else None))
         except Exception as exc:
             self.events.put(("legacy_data_scan_failed", str(exc)))
+
+    def _legacy_scan_already_done(self) -> bool:
+        """同一个版本只做一次深度查找，避免每次启动都全盘扫描。"""
+        try:
+            payload = json.loads(self.legacy_scan_marker_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return False
+        return isinstance(payload, dict) and payload.get('version') == APP_VERSION
 
     def _mark_legacy_profile_scan_complete(self) -> None:
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
-            self.legacy_scan_marker_path.write_text('completed\n', encoding='utf-8')
+            self.legacy_scan_marker_path.write_text(
+                json.dumps({'version': APP_VERSION, 'checked_at': utc_now()}, ensure_ascii=False),
+                encoding='utf-8',
+            )
         except OSError:
             pass
 
+    def _backup_database_before_auto_migration(self) -> Path | None:
+        """自动替换共享账号库之前先留一份备份，随时可以用「迁移旧版数据」换回来。"""
+        stats = account_database_stats(self.database_path) or (0, 0)
+        if not stats[0]:
+            return None
+        backup_path = self.data_dir / f"steam_ban_accounts.before-auto-migration-{datetime.now().strftime('%Y%m%d-%H%M%S')}.sqlite3"
+        try:
+            copy_sqlite_database(self.database_path, backup_path)
+        except (OSError, sqlite3.Error):
+            return None
+        return backup_path
+
     def _automatically_migrate_legacy_database(self, source_database: Path) -> bool:
-        """后台扫描找到旧版库后，在 UI 线程无确认地迁移空的新账号库。"""
-        if self.store.count_accounts() or self.query_running or self.import_running or self.login_running:
-            self.status_var.set("已自动找到旧版账号库；当前已有新数据或任务正在运行，请点击“迁移旧版数据”后按提示处理。")
+        """后台找到更完整的旧版库后，在 UI 线程直接继承，不需要用户做任何操作。"""
+        current_stats = account_database_stats(self.database_path) or (0, 0)
+        source_stats = account_database_stats(source_database) or (0, 0)
+        if not legacy_migration_is_worthwhile(current_stats, source_stats):
+            self.status_var.set("已找到旧版账号库，但当前账号库更完整，未做替换；如需手动处理可点击“迁移旧版数据”。")
+            return True
+        if self.query_running or self.import_running or self.login_running:
+            self.status_var.set("已自动找到旧版账号库；当前有任务在运行，完成后重新打开程序即可自动继承。")
             return False
+        backup_path = self._backup_database_before_auto_migration()
         self.store.close()
         try:
             migrated_database, migrated_settings = migrate_legacy_user_data(
@@ -2950,14 +3173,14 @@ class SteamBanApp:
             self.store = AccountStore(self.database_path)
         except (OSError, sqlite3.Error, ValueError) as exc:
             self.store = AccountStore(self.database_path)
-            self.status_var.set(f"已找到旧版账号库，但自动迁移失败：{exc}；可点击“迁移旧版数据”重试。")
+            self.status_var.set(f"已自动找到旧版账号库，但继承失败：{exc}；可点击“迁移旧版数据”重试。")
             return False
 
         try:
             saved_api_key = self.key_store.load()
         except KeyStorageError as exc:
             saved_api_key = None
-            key_problem = f"；已迁移账号库，但保存的 Key 无法读取：{exc}"
+            key_problem = f"；账号库已继承，但保存的 Key 无法读取：{exc}"
         else:
             key_problem = ''
         self.api_key_var.set(saved_api_key or '')
@@ -2966,7 +3189,11 @@ class SteamBanApp:
         self.checked_ids.clear()
         self.refresh_table()
         key_suffix = '和已保存的 Key' if migrated_settings else ''
-        self.status_var.set(f"已自动迁移旧版账号库{key_suffix}；以后更新会自动继承本机数据。{key_problem}")
+        backup_suffix = f"（原库已备份为 {backup_path.name}）" if backup_path else ''
+        self.status_var.set(
+            f"已自动继承旧版账号库{key_suffix}（来源：{source_database.parent}）{backup_suffix}；"
+            f"以后更新会自动使用这份数据。{key_problem}"
+        )
         return True
 
     def migrate_legacy_data(self) -> None:
@@ -3384,7 +3611,8 @@ class SteamBanApp:
                     self.legacy_scan_running = False
                     self._should_scan_legacy_profile = False
                     if payload:
-                        if self._automatically_migrate_legacy_database(Path(payload)) or self.store.count_accounts():
+                        handled = self._automatically_migrate_legacy_database(Path(payload))
+                        if handled or self.store.count_accounts():
                             self._mark_legacy_profile_scan_complete()
                     else:
                         self._mark_legacy_profile_scan_complete()
@@ -3507,7 +3735,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v3.1.4") == (3, 1, 4)
+    assert version_key("v3.1.5") == (3, 1, 5)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -3545,18 +3773,57 @@ def run_self_test() -> None:
         deep_legacy_directory.mkdir(parents=True)
         deep_store = AccountStore(deep_legacy_directory / ACCOUNT_DATABASE_FILENAME)
         deep_store.upsert_account("深层迁移账号", "76561198000000008", "自动发现")
+        deep_store.upsert_account("深层迁移账号二", "76561198000000006", "自动发现")
         deep_store.close()
         assert find_legacy_account_database_in_profile(root, shared_data_directory) == deep_legacy_directory / ACCOUNT_DATABASE_FILENAME
-        # 深层扫描在线程中只负责发现路径，实际迁移仍回到 UI 事件队列，避免跨线程操作界面数据库。
+        # 固定磁盘只扫两层：工具被解压到“某盘\某目录\某子目录”时也能找到，且不会进入共享数据目录。
+        stale_directory = root / "Documents" / "old-copy"
+        stale_directory.mkdir(parents=True)
+        stale_store = AccountStore(stale_directory / ACCOUNT_DATABASE_FILENAME)
+        stale_store.upsert_account("过期副本", "76561198000000007", "")
+        stale_store.close()
+        shallow_candidates = find_account_databases(root, max_depth=2, excluded_directories=[shared_data_directory])
+        assert stale_directory / ACCOUNT_DATABASE_FILENAME in shallow_candidates
+        assert deep_legacy_directory / ACCOUNT_DATABASE_FILENAME not in shallow_candidates
+        assert shared_data_directory / ACCOUNT_DATABASE_FILENAME not in shallow_candidates
+        assert isinstance(fixed_drive_roots(), list)
+        assert account_database_stats(deep_legacy_directory / ACCOUNT_DATABASE_FILENAME) == (2, 0)
+        # 候选库按“账号多、密码全、更新得晚”排序：拿 1 条账号的旧副本去顶替 3 条账号的库是不允许的。
+        assert best_migratable_legacy_database(
+            [stale_directory / ACCOUNT_DATABASE_FILENAME, deep_legacy_directory / ACCOUNT_DATABASE_FILENAME],
+            (0, 0),
+        ) == deep_legacy_directory / ACCOUNT_DATABASE_FILENAME
+        assert legacy_migration_is_worthwhile((0, 0), (1, 0)) is True           # 当前是空库
+        assert legacy_migration_is_worthwhile((0, 0), (0, 0)) is False          # 旧库里没有账号
+        assert legacy_migration_is_worthwhile((1, 0), (1, 1)) is True           # 当前库丢了密码
+        assert legacy_migration_is_worthwhile((1, 0), (1, 0)) is False          # 旧库也没有密码
+        assert legacy_migration_is_worthwhile((30, 0), (10, 10)) is False       # 账号更少，不能顶替
+        assert legacy_migration_is_worthwhile((30, 30), (3000, 30)) is False    # 当前库有密码就不动它
+        # 老版本的表可能没有 password_enc 列：这种库仍然要能被识别和迁移（打开时会自动补列）。
+        old_schema_path = root / "old-schema.sqlite3"
+        old_connection = sqlite3.connect(old_schema_path)
+        old_connection.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, account_name TEXT, steam_id TEXT)")
+        old_connection.execute("INSERT INTO accounts (account_name, steam_id) VALUES ('老结构账号', '76561198000000005')")
+        old_connection.commit()
+        old_connection.close()
+        assert account_database_stats(old_schema_path) == (1, 0)
+        assert is_account_database(old_schema_path) is True
+        old_schema_store = AccountStore(old_schema_path)
+        assert old_schema_store.count_accounts() == 1
+        assert 'password_enc' in {row[1] for row in old_schema_store.connection.execute('PRAGMA table_info(accounts)')}
+        old_schema_store.close()
+        # 后台线程只负责发现路径，实际迁移仍回到 UI 事件队列，避免跨线程操作界面数据库。
         scan_app = SteamBanApp.__new__(SteamBanApp)
         scan_app.events = queue.Queue()
         scan_app.data_dir = shared_data_directory
-        saved_profile_finder = globals()['find_legacy_account_database_in_profile']
+        scan_app.database_path = root / "EmptyData" / ACCOUNT_DATABASE_FILENAME
+        scan_app.install_dir = root / "new-release"
+        saved_collector = globals()['collect_legacy_account_databases']
         try:
-            globals()['find_legacy_account_database_in_profile'] = lambda _home, _data: deep_legacy_directory / ACCOUNT_DATABASE_FILENAME
+            globals()['collect_legacy_account_databases'] = lambda *_args, **_kwargs: [deep_legacy_directory / ACCOUNT_DATABASE_FILENAME]
             scan_app._legacy_profile_scan_worker()
         finally:
-            globals()['find_legacy_account_database_in_profile'] = saved_profile_finder
+            globals()['collect_legacy_account_databases'] = saved_collector
         assert scan_app.events.get_nowait() == ('legacy_data_found', str(deep_legacy_directory / ACCOUNT_DATABASE_FILENAME))
 
         store = AccountStore(root / "test.sqlite3")
