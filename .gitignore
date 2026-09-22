@@ -1,0 +1,28 @@
+# ---- 本地数据：绝对不要提交 ----
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+steam_ban_settings.json
+steam_ban_accounts.sqlite3
+
+# ---- 账号清单 / 导出文件 ----
+账号清单.csv
+steam_accounts*.csv
+steam_ban_results_*.csv
+export.csv
+export.json
+export.txt
+
+# ---- 构建产物 ----
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
