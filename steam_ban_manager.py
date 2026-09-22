@@ -32,7 +32,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 
@@ -686,6 +686,20 @@ class AccountStore:
             (limit, offset),
         ).fetchall()
         return rows, total
+
+    def login_timestamps(self, account_ids: Iterable[int]) -> dict[int, tuple[str | None, str | None]]:
+        """读取已加载行的登录时间，供整点时原地更新计时单元格。"""
+        ids = [int(account_id) for account_id in account_ids]
+        if not ids:
+            return {}
+        placeholders = ', '.join('?' for _ in ids)
+        rows = self.connection.execute(
+            f'SELECT id, last_logout_at, last_login_at FROM accounts WHERE id IN ({placeholders})', ids
+        ).fetchall()
+        return {
+            int(row['id']): (row['last_logout_at'], row['last_login_at'])
+            for row in rows
+        }
 
     def active_account_id(self) -> int | None:
         """返回上一次由本工具成功登录、且尚未在下一次切换中退出的账号。"""
@@ -2307,13 +2321,19 @@ class SteamBanApp:
         self.status_var.set("已清除本机加密保存的 API Key。")
 
     def _schedule_login_timer_refresh(self) -> None:
-        """小时数会跨整点变化；下一整点刷新列表即可，无须高频重绘大账号库。"""
+        """小时数会跨整点变化；下一整点只更新已加载行的计时单元格。"""
         now = datetime.now()
         seconds_to_next_hour = max(1, 3600 - now.minute * 60 - now.second)
         self.root.after(seconds_to_next_hour * 1000, self._refresh_login_timers)
 
     def _refresh_login_timers(self) -> None:
-        self.refresh_table()
+        # 不能调用 refresh_table()：它会清空 Treeview、重新从第一页加载，从而让大列表跳回顶部。
+        items = tuple(self.tree.get_children())
+        timestamps = self.store.login_timestamps(int(item) for item in items)
+        for item in items:
+            timestamp = timestamps.get(int(item))
+            if timestamp is not None:
+                self.tree.set(item, 'login_elapsed', login_elapsed_label(*timestamp))
         self._schedule_login_timer_refresh()
 
     def check_for_updates(self) -> None:
@@ -2325,7 +2345,13 @@ class SteamBanApp:
             return
         self.update_check_running = True
         self.update_button.configure(text="正在检查…", state="disabled")
-        threading.Thread(target=self._update_check_worker, daemon=True).start()
+        try:
+            threading.Thread(target=self._update_check_worker, daemon=True).start()
+        except Exception as exc:
+            # 即使线程启动失败，也必须把按钮还原，不能把「正在检查」永久留在界面上。
+            self.update_check_running = False
+            self.update_button.configure(text="检查更新", command=self.check_for_updates, state="normal")
+            self.status_var.set(f"无法启动更新检查：{exc}")
 
     def _update_check_worker(self) -> None:
         try:
@@ -2336,6 +2362,8 @@ class SteamBanApp:
             )
             with urlopen(request, timeout=8) as response:
                 payload = json.loads(response.read().decode('utf-8'))
+            if not isinstance(payload, dict):
+                raise ValueError('GitHub Release 响应不是 JSON 对象。')
             tag_name = str(payload.get('tag_name') or '')
             release_version = version_key(tag_name)
             current_version = version_key(APP_VERSION)
@@ -2346,7 +2374,9 @@ class SteamBanApp:
                 self.events.put(('update_available', (tag_name.lstrip('v'), release_url)))
             else:
                 self.events.put(('update_current', None))
-        except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+        except Exception as exc:
+            # 代理/劫持页或未来 API 字段变化都不应让后台线程悄悄退出，
+            # 必须投递失败事件，由 UI 线程恢复「检查更新」按钮。
             self.events.put(('update_check_failed', str(exc)))
 
     def _open_update_page(self) -> None:
@@ -3124,7 +3154,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v3.1.0") == (3, 1, 0)
+    assert version_key("v3.1.1") == (3, 1, 1)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -3189,6 +3219,9 @@ def run_self_test() -> None:
         assert login_elapsed_label(
             activity_rows[1]["last_logout_at"], activity_rows[1]["last_login_at"], fixed_now
         ) == "距上次登录 50 小时"
+        activity_times = activity_store.login_timestamps([older_id, newer_id])
+        assert activity_times[older_id] == ("2026-09-20 10:00:00 +0800", "2026-09-20 08:00:00 +0800")
+        assert activity_times[newer_id] == (None, "2026-09-21 08:00:00 +0800")
         activity_store.mark_account_logged_out(newer_id, "2026-09-22 11:00:00 +0800")
         assert activity_store.active_account_id() is None
         activity_store.close()
@@ -3518,6 +3551,85 @@ def run_self_test() -> None:
         assert progress_app.query_progress_bar.value == 58
         assert progress_app.query_progress_var.get() == "正在查询：7 / 12（58%）"
         assert progress_app.query_progress_card.pack_args is not None
+
+        # 整点计时只改当前已加载行的单元格，不重建 Treeview，也不影响滚动位置/懒加载进度。
+        class FakeTimerTree:
+            def __init__(self):
+                self.values = {}
+
+            def get_children(self):
+                return ("101", "202")
+
+            def set(self, item, column, value):
+                self.values[(item, column)] = value
+
+        class FakeTimerStore:
+            def login_timestamps(self, account_ids):
+                assert list(account_ids) == [101, 202]
+                return {
+                    101: ("2020-01-01 00:00:00 +0800", "2020-01-01 00:00:00 +0800"),
+                    202: (None, "2026-09-22 11:00:00 +0800"),
+                }
+
+        timer_app = SteamBanApp.__new__(SteamBanApp)
+        timer_app.tree = FakeTimerTree()
+        timer_app.store = FakeTimerStore()
+        timer_refreshes = []
+        timer_app._schedule_login_timer_refresh = lambda: timer_refreshes.append(True)
+        timer_app._refresh_login_timers()
+        assert timer_app.tree.values == {
+            ("101", "login_elapsed"): "上次登录：2020-01-01",
+            ("202", "login_elapsed"): "当前登录中",
+        }
+        assert timer_refreshes == [True]
+
+        # GitHub/代理返回 JSON 数组时，也要把失败事件交回 UI，按钮不能永久禁用。
+        class FakeUpdateResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return b'[]'
+
+        update_app = SteamBanApp.__new__(SteamBanApp)
+        update_app.events = queue.Queue()
+        saved_urlopen = globals()['urlopen']
+        try:
+            globals()['urlopen'] = lambda *_args, **_kwargs: FakeUpdateResponse()
+            update_app._update_check_worker()
+        finally:
+            globals()['urlopen'] = saved_urlopen
+        assert update_app.events.get_nowait()[0] == 'update_check_failed'
+
+        class FakeUpdateButton:
+            def __init__(self):
+                self.options = {}
+
+            def configure(self, **kwargs):
+                self.options.update(kwargs)
+
+        class FakeEventRoot:
+            def __init__(self):
+                self.after_calls = []
+
+            def after(self, *args):
+                self.after_calls.append(args)
+
+        update_ui_app = SteamBanApp.__new__(SteamBanApp)
+        update_ui_app.events = queue.Queue()
+        update_ui_app.events.put(('update_check_failed', 'mock malformed response'))
+        update_ui_app.update_check_running = True
+        update_ui_app.update_button = FakeUpdateButton()
+        update_ui_app.root = FakeEventRoot()
+        update_ui_app._drain_events()
+        assert update_ui_app.update_check_running is False
+        assert update_ui_app.update_button.options['text'] == '检查更新'
+        assert update_ui_app.update_button.options['state'] == 'normal'
+        assert update_ui_app.root.after_calls
 
         # 运行中的登录被拒绝，双击列表或重复点击都不能再启动第二个 Steam 线程。
         login_guard_app = SteamBanApp.__new__(SteamBanApp)
