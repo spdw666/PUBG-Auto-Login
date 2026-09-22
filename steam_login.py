@@ -125,6 +125,11 @@ def write_auto_login(steam_exe: str, steam_id: str, account_name: str) -> Path:
 
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, "AutoLoginUser", 0, winreg.REG_SZ, account_name)
+            # Steam 账号切换器（V9）会同时写这几个值：记住密码 + 允许自动登录，
+            # 这样下次切换回该账号时 Steam 会用缓存的令牌直接进去，不用再传密码。
+            winreg.SetValueEx(key, "AutoLoginUser_steamchina", 0, winreg.REG_SZ, account_name)
+            winreg.SetValueEx(key, "RememberPassword", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(key, "AllowAutoLogin", 0, winreg.REG_DWORD, 1)
     except OSError:
         pass
     return path
@@ -169,13 +174,17 @@ def shutdown_steam(steam_exe: str, timeout: float = 40.0) -> bool:
     return not steam_running()
 
 
-def launch_login(steam_exe: str, account: str) -> subprocess.Popen:
-    """用命令行参数启动 Steam 并预填账号名，密码由 automate_steam_login 注入登录窗口。
+def launch_login(steam_exe: str, account: str, password: str = '') -> subprocess.Popen:
+    """带账号密码直接启动 Steam（这就是 Steam 账号切换器类工具的标准做法）。
 
-    这里刻意不带密码：现代 Steam 客户端已经不读命令行里的密码，带上只会让密码明文出现在
-    任务管理器 / WMI 的进程命令行里。带上 -noreactlogin 是为了让旧版登录框出现。
+    实测（2026-09，本机 Steam）：steam.exe -noreactlogin -login 账号 密码 会在 10 秒左右
+    直接登录成功，完全不需要模拟键盘或鼠标；不带密码时 Steam 只会弹出登录框并停在那里。
+    代价是密码会出现在进程命令行里（任务管理器/WMI 可见），所以只在真正需要登录时调用。
     """
-    return subprocess.Popen([steam_exe, "-noreactlogin", "-login", account],
+    command = [steam_exe, "-noreactlogin", "-login", account]
+    if password:
+        command.append(password)
+    return subprocess.Popen(command,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 # ---------------------------------------------------------------------------
@@ -478,6 +487,11 @@ LOGIN_DIAGNOSE_AFTER = 10.0
 # 登录窗口 4~5 秒就会出来，但密码要通过 Steam 与服务器的连接提交。网络慢/走代理时
 # 先等它变成 [Connected] 再填密码，避免提交时 Steam 还没连上。
 LOGIN_CONNECTION_WAIT = 45.0
+# 命令行带上密码后，Steam 通常 5~10 秒就登录完成；给它 60 秒上限。
+LOGIN_COMMAND_TIMEOUT = 60.0
+# 命令行带上账号密码后 Steam 通常 5~10 秒自己就登录成功了。登录窗口只是过程中的旧版
+# 对话框，先给它这段时间；真的登录成功就完全不需要模拟键盘鼠标（这也正是 V9 的做法）。
+LOGIN_COMMAND_GRACE = 20.0
 LOGIN_PROGRESS_INTERVAL = 2.0
 LOGIN_FORM_READY_DELAY = 2.5
 LOGIN_SUBMIT_RESULT_WAIT = 15.0
@@ -542,6 +556,8 @@ def _declare_win32() -> None:
     user32.IsWindowVisible.restype = W.BOOL
     user32.IsWindow.argtypes = [W.HWND]
     user32.IsWindow.restype = W.BOOL
+    user32.IsIconic.argtypes = [W.HWND]
+    user32.IsIconic.restype = W.BOOL
     user32.GetWindowTextLengthW.argtypes = [W.HWND]
     user32.GetWindowTextLengthW.restype = ctypes.c_int
     user32.GetWindowTextW.argtypes = [W.HWND, W.LPWSTR, ctypes.c_int]
@@ -674,28 +690,57 @@ def _is_expected_steam_process_image(process_image: str | None, steam_exe: str) 
         return False
 
 
+def _window_looks_like_login_dialog(hwnd: int) -> bool:
+    """窗口必须是可见、未最小化、尺寸正常的对话框。
+
+    最小化的窗口（位置 -21333,-21333、客户区只有 158x26）标题同样含 Steam，
+    如果把它当成登录窗口，后面按它的矩形算出来的坐标全是垃圾，密码会填到空气里。
+    """
+    user32 = _user32()
+    if not user32.IsWindowVisible(hwnd):
+        return False
+    if user32.IsIconic(hwnd):
+        return False
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    return (rect.right - rect.left) >= 320 and (rect.bottom - rect.top) >= 240
+
+
 def _find_login_window(steam_exe: str) -> int:
     """找到当前 Steam 安装目录所属的登录窗口句柄；没找到返回 0。
 
-    标题只能用于缩小范围，不能作为身份认证。任何无法验证进程路径的窗口一律跳过。
+    标题只能用于缩小范围，不能作为身份认证：先精确匹配已知登录标题（最可信），
+    再退化为“标题含 Steam”，并且只接受可见、未最小化、尺寸正常的窗口。
+    任何无法验证进程路径的窗口一律跳过。
     """
     user32 = _user32()
-    found = []
+    exact: list[int] = []
+    loose: list[int] = []
 
     def callback(hwnd, _lparam):
-        if user32.IsWindowVisible(hwnd):
-            length = user32.GetWindowTextLengthW(hwnd)
-            buffer = ctypes.create_unicode_buffer(length + 2)
-            user32.GetWindowTextW(hwnd, buffer, length + 2)
-            if (
-                _is_login_window_title(buffer.value)
-                and _is_expected_steam_process_image(_window_process_image(hwnd), steam_exe)
-            ):
-                found.append(hwnd)
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        buffer = ctypes.create_unicode_buffer(length + 2)
+        user32.GetWindowTextW(hwnd, buffer, length + 2)
+        title = (buffer.value or '').strip()
+        if not _is_login_window_title(title):
+            return True
+        if not _is_expected_steam_process_image(_window_process_image(hwnd), steam_exe):
+            return True
+        if not _window_looks_like_login_dialog(hwnd):
+            return True
+        if title in LOGIN_WINDOW_TITLES:
+            exact.append(hwnd)
+        else:
+            loose.append(hwnd)
         return True
 
     user32.EnumWindows(_WNDENUMPROC(callback), 0)
-    return found[0] if found else 0
+    if exact:
+        return exact[0]
+    return loose[0] if loose else 0
 
 
 def _key(vk: int, up: bool = False) -> None:
@@ -767,7 +812,9 @@ def _click_password_field(hwnd: int) -> bool:
     height = rect.bottom - rect.top
     if width <= 0 or height <= 0:
         return False
-    _click_at(rect.left + int(width * 0.5), rect.top + int(height * 0.42))
+    # 实测（700x440 的 Steam 登录窗）：密码框中心在窗口高度的 34% 处。
+    # 点 42% 会落到密码框下方的空白，粘贴随之落空、回车还会提交一个空表单。
+    _click_at(rect.left + int(width * 0.5), rect.top + int(height * 0.34))
     return True
 
 
@@ -936,6 +983,68 @@ def describe_steam_startup(steam_exe: str) -> str:
     return 'Steam 既没有自动登录、也没有弹出登录窗口（可能窗口被别的程序挡住，或客户端状态异常）'
 
 
+def connection_log_size(steam_exe: str) -> int:
+    """当前 connection_log.txt 的字节数（用来只认本次会话新写的日志）。"""
+    log_path = Path(steam_exe).parent / 'logs' / 'connection_log.txt'
+    try:
+        return log_path.stat().st_size
+    except OSError:
+        return 0
+
+
+def logged_on_since(steam_exe: str, start_offset: int) -> bool:
+    """本次会话（start_offset 之后新写入的日志）里是否出现 [Logged On。
+
+    不能只看注册表 ActiveUser：Steam 被结束后那个值不会清零，会把上一次的账号
+    当成本次登录成功（假成功）。日志才是分会话的。
+    """
+    log_path = Path(steam_exe).parent / 'logs' / 'connection_log.txt'
+    try:
+        if not log_path.is_file():
+            return False
+        size = log_path.stat().st_size
+        if size <= start_offset:
+            return False
+        with log_path.open('rb') as handle:
+            handle.seek(start_offset)
+            fresh = handle.read().decode('utf-8', 'replace')
+    except OSError:
+        return False
+    return '[Logged On' in fresh
+
+
+def wait_for_logged_on(
+    steam_exe: str,
+    timeout: float,
+    cancel_event: threading.Event | None = None,
+    progress: Callable[[float], None] | None = None,
+    start_offset: int | None = None,
+    start_account: int | None = None,
+) -> bool:
+    """等本次会话登录成功（只认新写入的日志或 ActiveUser 变化）。"""
+    if start_offset is None:
+        start_offset = connection_log_size(steam_exe)
+    if start_account is None:
+        start_account = active_login_account_id()
+    started = time.time()
+    deadline = started + max(0.5, timeout)
+    last_report = 0.0
+    while time.time() < deadline:
+        _raise_if_login_cancelled(cancel_event)
+        if logged_on_since(steam_exe, start_offset):
+            return True
+        account_id = active_login_account_id()
+        if account_id and account_id != start_account:
+            return True
+        elapsed = time.time() - started
+        if progress is not None and elapsed - last_report >= LOGIN_PROGRESS_INTERVAL:
+            last_report = elapsed
+            progress(elapsed)
+        if _wait_or_cancel(cancel_event, 0.5):
+            _raise_if_login_cancelled(cancel_event)
+    return logged_on_since(steam_exe, start_offset)
+
+
 def wait_for_steam_login(
     steam_exe: str,
     timeout: float = LOGIN_WINDOW_TIMEOUT,
@@ -953,10 +1062,14 @@ def wait_for_steam_login(
     deadline = started + max(1.0, timeout)
     last_report = 0.0
     diagnosed = False
+    start_account = active_login_account_id()
+    start_offset = connection_log_size(steam_exe)
     while time.time() < deadline:
         _raise_if_login_cancelled(cancel_event)
         account_id = active_login_account_id()
-        if account_id:
+        if logged_on_since(steam_exe, start_offset):
+            return 'logged_in', account_id or 0
+        if account_id and account_id != start_account:
             return 'logged_in', account_id
         hwnd = _find_login_window(steam_exe)
         if hwnd:
@@ -986,11 +1099,14 @@ def automate_steam_login(
         return '自动填密码仅支持 Windows'
     state, value = wait_for_steam_login(steam_exe, timeout, cancel_event, progress, diagnose)
     if state == 'logged_in':
-        # loginusers.vdf + 注册表 AutoLoginUser 这条路生效了：Steam 用本机缓存的登录信息直接进去，不需要密码。
-        return '已用本机记住的登录信息自动登录成功（loginusers.vdf + 注册表），本次没有使用密码'
+        # 两条路都会到这里：Steam 用缓存令牌免密进去，或命令行账号密码直接登录成功。
+        return '已自动登录成功（Steam 用命令行账号密码或本机记住的登录信息直接进入，全程没有模拟键盘鼠标）'
     if state == 'timeout':
         return f'{int(timeout)} 秒内没有等到 Steam 登录窗口，也没检测到 Steam 已登录：{describe_steam_startup(steam_exe)}'
     hwnd = value
+    # 先让命令行账号密码自己登录（实测 5~10 秒）。成功就返回，完全不模拟键盘鼠标。
+    if wait_for_logged_on(steam_exe, LOGIN_COMMAND_GRACE, cancel_event, progress):
+        return '已自动登录成功（命令行账号密码，全程没有模拟键盘鼠标）'
     user32 = _user32()
     if not _bring_to_foreground(hwnd):
         return 'Steam 登录窗口没能切到前台，已跳过自动填密码；请手动点一下 Steam 窗口后重试'
@@ -998,11 +1114,11 @@ def automate_steam_login(
         _raise_if_login_cancelled(cancel_event)
     if user32.GetForegroundWindow() != hwnd:
         return 'Steam 登录窗口被其它窗口抢到前台，已跳过自动填密码'
-    # 密码是走 Steam 与服务器的连接提交的：网络慢或走代理时，登录窗口会先出现，
-    # 此时直接提交多半失败。先等它连上（最多 LOGIN_CONNECTION_WAIT 秒）。
+    # 实测：即使 Steam 此刻还显示 connecting（代理环境常见），提交密码后它会在连上
+    # 服务器的瞬间完成登录，所以这里不再等待连接，避免白等几十秒。
     connection_note = ''
-    if not wait_for_steam_connection(steam_exe, cancel_event=cancel_event, progress=progress):
-        connection_note = '（注意：提交时 Steam 仍未连上服务器，若失败请先解决代理/VPN）'
+    if steam_connection_state(steam_exe) == 'connecting':
+        connection_note = '（注意：Steam 当时仍在连接服务器；若未登录成功，请先解决代理/VPN）'
     if not _set_clipboard(password):
         return '剪贴板不可用，已跳过自动填密码'
     try:
@@ -1016,13 +1132,16 @@ def automate_steam_login(
         if _wait_or_cancel(cancel_event, 0.6):
             _raise_if_login_cancelled(cancel_event)
         _press(_VK_RETURN)
+        submit_offset = connection_log_size(steam_exe)
+        submit_account = active_login_account_id()
         deadline = time.time() + max(1.0, LOGIN_SUBMIT_RESULT_WAIT)
         while time.time() < deadline:
             if _wait_or_cancel(cancel_event, 1.0):
                 _raise_if_login_cancelled(cancel_event)
-            if active_login_account_id():
+            if logged_on_since(steam_exe, submit_offset):
                 return '密码提交成功，Steam 已登录' + connection_note
-            if steam_connection_state(steam_exe) == 'logged_on':
+            current = active_login_account_id()
+            if current and current != submit_account:
                 return '密码提交成功，Steam 已登录' + connection_note
             if not user32.IsWindow(hwnd):
                 return '已自动填入密码并提交' + connection_note

@@ -34,7 +34,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.2.2"
+APP_VERSION = "3.2.3"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
@@ -3245,7 +3245,7 @@ class SteamBanApp:
             if cancel_event is not None and cancel_event.is_set():
                 self.events.put(("steam_login_cancelled", None))
                 return
-            steam_login.launch_login(steam_exe, account_name)
+            steam_login.launch_login(steam_exe, account_name, password)
 
             def login_progress(elapsed: float) -> None:
                 # 后台线程只投递事件，界面文案在主线程更新，避免跨线程操作控件。
@@ -4129,7 +4129,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v3.2.2") == (3, 2, 2)
+    assert version_key("v3.2.3") == (3, 2, 3)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -4363,7 +4363,9 @@ def run_self_test() -> None:
         ) is False
         # 启动 Steam 的命令行里不能再出现密码。
         import inspect as _inspect
-        assert 'password' not in str(_inspect.signature(steam_login.launch_login))
+        # 账号密码是随命令行传给 Steam 的（Steam 账号切换器 V9 的做法）：实测 10 秒内直接
+        # 登录成功，不需要模拟键盘鼠标；没有缓存令牌的新账号也能登录。
+        assert 'password' in str(_inspect.signature(steam_login.launch_login))
         assert hasattr(steam_login.wintypes, 'DWORD')
         cancelled_login = threading.Event()
         cancelled_login.set()
@@ -4376,7 +4378,14 @@ def run_self_test() -> None:
         saved_active_account = steam_login.active_login_account_id
         saved_find_window = steam_login._find_login_window
         try:
-            steam_login.active_login_account_id = lambda: 791798680
+            # 只会话内发生变化才算登录成功：第一次读（作为基线）返回 None，之后返回账号。
+            active_calls = {'count': 0}
+
+            def fake_active_account():
+                active_calls['count'] += 1
+                return None if active_calls['count'] == 1 else 791798680
+
+            steam_login.active_login_account_id = fake_active_account
             assert steam_login.wait_for_steam_login(expected_steam_exe, timeout=1.0) == ('logged_in', 791798680)
             steam_login.active_login_account_id = lambda: None
             steam_login._find_login_window = lambda _exe: 4242
@@ -4467,6 +4476,7 @@ def run_self_test() -> None:
         saved_set_clipboard = steam_login._set_clipboard
         saved_clear_clipboard = steam_login._clear_clipboard
         saved_wait_connection = steam_login.wait_for_steam_connection
+        saved_connection_state = steam_login.steam_connection_state
         saved_paste = steam_login._paste
         saved_press = steam_login._press
         saved_wait_or_cancel = steam_login._wait_or_cancel
@@ -4474,6 +4484,7 @@ def run_self_test() -> None:
             steam_login._user32 = lambda: FakeLoginWindow()
             steam_login.active_login_account_id = lambda: None
             steam_login.wait_for_steam_connection = lambda *_args, **_kwargs: True
+            steam_login.steam_connection_state = lambda *_args, **_kwargs: 'connected' 
             steam_login._find_login_window = lambda _steam_exe: 4242
             steam_login._set_clipboard = lambda text: login_steps.append(('clipboard', text)) or True
             steam_login._clear_clipboard = lambda: login_steps.append(('clear', None))
@@ -4485,6 +4496,7 @@ def run_self_test() -> None:
             steam_login._user32 = saved_user32
             steam_login.active_login_account_id = saved_active_login
             steam_login.wait_for_steam_connection = saved_wait_connection
+            steam_login.steam_connection_state = saved_connection_state
             steam_login._find_login_window = saved_find_login_window
             steam_login._set_clipboard = saved_set_clipboard
             steam_login._clear_clipboard = saved_clear_clipboard
@@ -4496,7 +4508,7 @@ def run_self_test() -> None:
         assert ('clipboard', 'single-submit-password') in login_steps and ('clear', None) in login_steps
         # 必须先把焦点点进密码框，再粘贴、最后回车（顺序错了密码就会粘进账号框）。
         login_kinds = [kind for kind, _value in login_steps]
-        assert ('cursor', (450, 384)) in login_steps
+        assert ('cursor', (450, 349)) in login_steps   # 700x440 窗口：中心 x、高度 34% 处（密码框）
         assert login_kinds.count('click') == 2
         assert login_kinds.index('cursor') < login_kinds.index('paste') < login_kinds.index('press')
         # 主接口网络失败 + 备用主机 403 时，不能报成“Key 被撤销”。
