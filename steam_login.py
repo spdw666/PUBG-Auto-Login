@@ -471,7 +471,13 @@ CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 STEAM_LOGIN_PROCESS_NAMES = frozenset({'steam.exe', 'steamwebhelper.exe'})
-LOGIN_WINDOW_TIMEOUT = 180.0
+LOGIN_WINDOW_TIMEOUT = 60.0
+# 正常情况下 Steam 启动后 4~5 秒就会弹出登录窗口（或直接用记住的信息进去）。
+# 10 秒还没有任何动静就说明出问题了，此刻立刻诊断并告知原因，而不是继续干等。
+LOGIN_DIAGNOSE_AFTER = 10.0
+# 登录窗口 4~5 秒就会出来，但密码要通过 Steam 与服务器的连接提交。网络慢/走代理时
+# 先等它变成 [Connected] 再填密码，避免提交时 Steam 还没连上。
+LOGIN_CONNECTION_WAIT = 45.0
 LOGIN_PROGRESS_INTERVAL = 2.0
 LOGIN_FORM_READY_DELAY = 2.5
 LOGIN_SUBMIT_RESULT_WAIT = 15.0
@@ -831,6 +837,68 @@ def active_login_account_id() -> int | None:
         return None
 
 
+# connection_log.txt 里的状态标记 -> 连接状态（后面的状态覆盖前面的）
+_CONNECTION_STATES = (
+    ('[Logged On', 'logged_on'),
+    ('[Logging On', 'connected'),
+    ('[Connected', 'connected'),
+    ('[Connecting', 'connecting'),
+    ('[Logged Off', 'connecting'),
+)
+
+
+def steam_connection_state(steam_exe: str, max_age: float = 300.0) -> str:
+    """读 Steam 自己的 connection_log.txt，返回最近的连接状态。
+
+    logged_on  —— 已经登录成功
+    connected  —— 连上了 Steam 服务器（可以提交密码）
+    connecting —— 还在连接（此时提交密码多半会失败，通常是被代理/VPN 拦了）
+    unknown    —— 读不到日志
+    """
+    log_path = Path(steam_exe).parent / 'logs' / 'connection_log.txt'
+    try:
+        if not log_path.is_file():
+            return 'unknown'
+        stat = log_path.stat()
+        if time.time() - stat.st_mtime > max_age:
+            return 'unknown'
+        with log_path.open('rb') as handle:
+            handle.seek(max(0, stat.st_size - 262144))
+            tail = handle.read().decode('utf-8', 'replace')
+    except OSError:
+        return 'unknown'
+    state = 'unknown'
+    for line in tail.splitlines()[-400:]:
+        for marker, value in _CONNECTION_STATES:
+            if marker in line:
+                state = value
+                break
+    return state
+
+
+def wait_for_steam_connection(
+    steam_exe: str,
+    timeout: float = LOGIN_CONNECTION_WAIT,
+    cancel_event: threading.Event | None = None,
+    progress: Callable[[float], None] | None = None,
+) -> bool:
+    """等 Steam 连上服务器（[Connected] / [Logged On]）；超时返回 False。"""
+    started = time.time()
+    deadline = started + max(1.0, timeout)
+    last_report = 0.0
+    while time.time() < deadline:
+        _raise_if_login_cancelled(cancel_event)
+        if steam_connection_state(steam_exe) in ('connected', 'logged_on'):
+            return True
+        elapsed = time.time() - started
+        if progress is not None and elapsed - last_report >= LOGIN_PROGRESS_INTERVAL:
+            last_report = elapsed
+            progress(elapsed)
+        if _wait_or_cancel(cancel_event, 1.0):
+            _raise_if_login_cancelled(cancel_event)
+    return steam_connection_state(steam_exe) in ('connected', 'logged_on')
+
+
 def steam_is_connecting(steam_exe: str, max_age: float = 180.0) -> bool:
     """从 Steam 自己的 connection_log.txt 判断它是不是还卡在连接服务器。
 
@@ -858,11 +926,22 @@ def steam_is_connecting(steam_exe: str, max_age: float = 180.0) -> bool:
     )
 
 
+def describe_steam_startup(steam_exe: str) -> str:
+    """Steam 启动后迟迟没有任何反应时的原因判断（给用户看的短句）。"""
+    if not steam_running():
+        return 'Steam 进程没有启动起来（可能被杀软/代理拦了，或客户端安装损坏）'
+    if steam_is_connecting(steam_exe):
+        return ('Steam 还在连接 Steam 服务器（代理/VPN 环境很常见）：请把 steamserver.net、'
+                'steampowered.com、steamcommunity.com 设为直连后重试')
+    return 'Steam 既没有自动登录、也没有弹出登录窗口（可能窗口被别的程序挡住，或客户端状态异常）'
+
+
 def wait_for_steam_login(
     steam_exe: str,
     timeout: float = LOGIN_WINDOW_TIMEOUT,
     cancel_event: threading.Event | None = None,
     progress: Callable[[float], None] | None = None,
+    diagnose: Callable[[str], None] | None = None,
 ) -> tuple[str, int]:
     """等 Steam 进入可处理状态，返回 (状态, 句柄或账号 ID)。
 
@@ -873,6 +952,7 @@ def wait_for_steam_login(
     started = time.time()
     deadline = started + max(1.0, timeout)
     last_report = 0.0
+    diagnosed = False
     while time.time() < deadline:
         _raise_if_login_cancelled(cancel_event)
         account_id = active_login_account_id()
@@ -882,6 +962,9 @@ def wait_for_steam_login(
         if hwnd:
             return 'login_window', hwnd
         elapsed = time.time() - started
+        if not diagnosed and elapsed >= LOGIN_DIAGNOSE_AFTER and diagnose is not None:
+            diagnosed = True
+            diagnose(describe_steam_startup(steam_exe))
         if progress is not None and elapsed - last_report >= LOGIN_PROGRESS_INTERVAL:
             last_report = elapsed
             progress(elapsed)
@@ -896,20 +979,17 @@ def automate_steam_login(
     timeout: float = LOGIN_WINDOW_TIMEOUT,
     cancel_event: threading.Event | None = None,
     progress: Callable[[float], None] | None = None,
+    diagnose: Callable[[str], None] | None = None,
 ) -> str:
     """等 Steam 自己登录或弹出登录窗口；只有后者才需要注入密码。"""
     if os.name != 'nt':
         return '自动填密码仅支持 Windows'
-    state, value = wait_for_steam_login(steam_exe, timeout, cancel_event, progress)
+    state, value = wait_for_steam_login(steam_exe, timeout, cancel_event, progress, diagnose)
     if state == 'logged_in':
         # loginusers.vdf + 注册表 AutoLoginUser 这条路生效了：Steam 用本机缓存的登录信息直接进去，不需要密码。
         return '已用本机记住的登录信息自动登录成功（loginusers.vdf + 注册表），本次没有使用密码'
     if state == 'timeout':
-        if steam_is_connecting(steam_exe):
-            return (f'等不到登录窗口：Steam 自己还没有连上 Steam 服务器（{int(timeout)} 秒）。'
-                    '这通常是因为代理/VPN 拦了 Steam 的连接：请把 Steam 相关域名（steamserver.net、'
-                    'steampowered.com、steamcommunity.com）设为直连后重试，或直接手动登录。')
-        return f'{int(timeout)} 秒内没有等到 Steam 登录窗口，也没检测到 Steam 已登录；请查看 Steam 窗口状态后重试'
+        return f'{int(timeout)} 秒内没有等到 Steam 登录窗口，也没检测到 Steam 已登录：{describe_steam_startup(steam_exe)}'
     hwnd = value
     user32 = _user32()
     if not _bring_to_foreground(hwnd):
@@ -918,6 +998,11 @@ def automate_steam_login(
         _raise_if_login_cancelled(cancel_event)
     if user32.GetForegroundWindow() != hwnd:
         return 'Steam 登录窗口被其它窗口抢到前台，已跳过自动填密码'
+    # 密码是走 Steam 与服务器的连接提交的：网络慢或走代理时，登录窗口会先出现，
+    # 此时直接提交多半失败。先等它连上（最多 LOGIN_CONNECTION_WAIT 秒）。
+    connection_note = ''
+    if not wait_for_steam_connection(steam_exe, cancel_event=cancel_event, progress=progress):
+        connection_note = '（注意：提交时 Steam 仍未连上服务器，若失败请先解决代理/VPN）'
     if not _set_clipboard(password):
         return '剪贴板不可用，已跳过自动填密码'
     try:
@@ -931,13 +1016,17 @@ def automate_steam_login(
         if _wait_or_cancel(cancel_event, 0.6):
             _raise_if_login_cancelled(cancel_event)
         _press(_VK_RETURN)
-        attempts = max(1, int(LOGIN_SUBMIT_RESULT_WAIT))
-        for _ in range(attempts):
+        deadline = time.time() + max(1.0, LOGIN_SUBMIT_RESULT_WAIT)
+        while time.time() < deadline:
             if _wait_or_cancel(cancel_event, 1.0):
                 _raise_if_login_cancelled(cancel_event)
+            if active_login_account_id():
+                return '密码提交成功，Steam 已登录' + connection_note
+            if steam_connection_state(steam_exe) == 'logged_on':
+                return '密码提交成功，Steam 已登录' + connection_note
             if not user32.IsWindow(hwnd):
-                return '已自动填入密码并提交'
-        return '已填入密码并提交一次；Steam 仍停在登录窗口，请按提示完成 Steam Guard 或手动继续'
+                return '已自动填入密码并提交' + connection_note
+        return '已填入密码并提交一次；Steam 仍停在登录窗口，请按提示完成 Steam Guard 或手动继续' + connection_note
     finally:
         # 任一 Win32 调用异常、线程被上层捕获或登录窗口消失时都不能把密码留在剪贴板。
         _clear_clipboard()

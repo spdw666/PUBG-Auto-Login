@@ -34,7 +34,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.2.1"
+APP_VERSION = "3.2.2"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
@@ -3251,8 +3251,13 @@ class SteamBanApp:
                 # 后台线程只投递事件，界面文案在主线程更新，避免跨线程操作控件。
                 self.events.put(("steam_login_waiting", elapsed))
 
+            def login_diagnose(reason: str) -> None:
+                # 10 秒还没有登录窗口就说明有问题，当场把原因显示出来而不是继续干等。
+                self.events.put(("steam_login_stalled", reason))
+
             login_result = steam_login.automate_steam_login(
-                password, steam_exe, cancel_event=cancel_event, progress=login_progress
+                password, steam_exe, cancel_event=cancel_event,
+                progress=login_progress, diagnose=login_diagnose,
             )
         except steam_login.LoginAutomationCancelled:
             self.events.put(("steam_login_cancelled", None))
@@ -4066,6 +4071,11 @@ class SteamBanApp:
                     account_id, logged_out_at = payload
                     self.store.mark_account_logged_out(account_id, logged_out_at)
                     changed = True
+                elif kind == "steam_login_stalled":
+                    self.status_var.set(
+                        f"启动 {int(steam_login.LOGIN_DIAGNOSE_AFTER)} 秒仍没有登录窗口：{payload}"
+                        "（仍在继续等待，可点“取消登录”）"
+                    )
                 elif kind == "steam_login_waiting":
                     if not (self.query_running or self.import_running or self.update_url):
                         self.status_var.set(
@@ -4119,7 +4129,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v3.2.1") == (3, 2, 1)
+    assert version_key("v3.2.2") == (3, 2, 2)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -4376,6 +4386,23 @@ def run_self_test() -> None:
         finally:
             steam_login.active_login_account_id = saved_active_account
             steam_login._find_login_window = saved_find_window
+        # 正常情况下 4~5 秒就会弹出登录窗口；10 秒还没有就必须当场诊断出原因（这里把阈值调小验证会触发）。
+        saved_diagnose_after = steam_login.LOGIN_DIAGNOSE_AFTER
+        saved_active_for_diagnose = steam_login.active_login_account_id
+        saved_find_for_diagnose = steam_login._find_login_window
+        diagnosed_reasons: list[str] = []
+        try:
+            steam_login.LOGIN_DIAGNOSE_AFTER = 0.1
+            steam_login.active_login_account_id = lambda: None
+            steam_login._find_login_window = lambda _exe: 0
+            steam_login.wait_for_steam_login(
+                expected_steam_exe, timeout=0.6, diagnose=diagnosed_reasons.append
+            )
+        finally:
+            steam_login.LOGIN_DIAGNOSE_AFTER = saved_diagnose_after
+            steam_login.active_login_account_id = saved_active_for_diagnose
+            steam_login._find_login_window = saved_find_for_diagnose
+        assert len(diagnosed_reasons) == 1 and diagnosed_reasons[0]
         # Steam 卡在连接服务器时，超时提示必须指出是网络/代理问题，而不是含糊的“没等到窗口”。
         fake_steam_root = root / 'fake-steam'
         (fake_steam_root / 'logs').mkdir(parents=True)
@@ -4391,6 +4418,19 @@ def run_self_test() -> None:
             encoding='utf-8',
         )
         assert steam_login.steam_is_connecting(str(fake_steam_root / 'steam.exe')) is False
+        # 连接状态要能区分“还在连”“连上了但没登录”“已登录”——密码只能在连上之后提交。
+        assert steam_login.steam_connection_state(str(fake_steam_root / 'steam.exe')) == 'logged_on'
+        connection_log.write_text(
+            '[2026-09-22 16:36:48] [Connecting, 0, 7] Connect() starting connection\n'
+            '[2026-09-22 16:36:49] [Connected, 0, 7] [U:1:0] ConnectionCompleted()\n',
+            encoding='utf-8',
+        )
+        assert steam_login.steam_connection_state(str(fake_steam_root / 'steam.exe')) == 'connected'
+        connection_log.write_text(
+            '[2026-09-22 16:19:47] [Connecting, 0, 0] YieldingConnect -- calling GetCMListForConnect\n',
+            encoding='utf-8',
+        )
+        assert steam_login.steam_connection_state(str(fake_steam_root / 'steam.exe')) == 'connecting' 
         # CEF 登录页的密码只能安全提交一次：后续 Tab/点击/粘贴会在页面状态已变化时破坏
         # 第一次正确提交。这里模拟窗口关闭，确认不再发送第二次粘贴、Tab 或 Enter。
         login_steps: list[tuple[str, Any]] = []
@@ -4426,12 +4466,14 @@ def run_self_test() -> None:
         saved_find_login_window = steam_login._find_login_window
         saved_set_clipboard = steam_login._set_clipboard
         saved_clear_clipboard = steam_login._clear_clipboard
+        saved_wait_connection = steam_login.wait_for_steam_connection
         saved_paste = steam_login._paste
         saved_press = steam_login._press
         saved_wait_or_cancel = steam_login._wait_or_cancel
         try:
             steam_login._user32 = lambda: FakeLoginWindow()
             steam_login.active_login_account_id = lambda: None
+            steam_login.wait_for_steam_connection = lambda *_args, **_kwargs: True
             steam_login._find_login_window = lambda _steam_exe: 4242
             steam_login._set_clipboard = lambda text: login_steps.append(('clipboard', text)) or True
             steam_login._clear_clipboard = lambda: login_steps.append(('clear', None))
@@ -4442,6 +4484,7 @@ def run_self_test() -> None:
         finally:
             steam_login._user32 = saved_user32
             steam_login.active_login_account_id = saved_active_login
+            steam_login.wait_for_steam_connection = saved_wait_connection
             steam_login._find_login_window = saved_find_login_window
             steam_login._set_clipboard = saved_set_clipboard
             steam_login._clear_clipboard = saved_clear_clipboard
