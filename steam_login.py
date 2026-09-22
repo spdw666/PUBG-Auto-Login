@@ -482,8 +482,113 @@ class LoginAutomationCancelled(Exception):
     """用户在等待 Steam 登录窗口时主动取消自动填密。"""
 
 
+class _MouseInput(ctypes.Structure):
+    _fields_ = [
+        ('dx', ctypes.wintypes.LONG),
+        ('dy', ctypes.wintypes.LONG),
+        ('mouseData', ctypes.wintypes.DWORD),
+        ('dwFlags', ctypes.wintypes.DWORD),
+        ('time', ctypes.wintypes.DWORD),
+        ('dwExtraInfo', ctypes.c_void_p),
+    ]
+
+
+class _InputUnion(ctypes.Union):
+    _fields_ = [('mi', _MouseInput)]
+
+
+class _Input(ctypes.Structure):
+    _anonymous_ = ('u',)
+    _fields_ = [('type', ctypes.wintypes.DWORD), ('u', _InputUnion)]
+
+
+_INPUT_MOUSE = 0
+_MOUSEEVENTF_LEFTDOWN = 0x0002
+_MOUSEEVENTF_LEFTUP = 0x0004
+_VK_MENU = 0x12
+_VK_CONTROL = 0x11
+_VK_V = 0x56
+_VK_TAB = 0x09
+_VK_RETURN = 0x0D
+_VK_A = 0x41
+_VK_DELETE = 0x2E
+_WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+_WIN32_DECLARED = False
+
+
+def _declare_win32() -> None:
+    """声明用到的 Win32 原型（只做一次）。
+
+    ctypes 对没声明的函数按 32 位 int 处理返回值：GlobalAlloc / GlobalLock /
+    GetForegroundWindow 这类返回指针或句柄的函数一旦被截断，就会崩成
+    "access violation writing 0x00000000"；keybd_event / SendInput 有 64 位参数，
+    也必须显式声明，否则第 4、5 个参数可能带上垃圾高位。
+    """
+    global _WIN32_DECLARED
+    if _WIN32_DECLARED or os.name != 'nt':
+        return
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    W = ctypes.wintypes
+    user32.IsWindowVisible.argtypes = [W.HWND]
+    user32.IsWindowVisible.restype = W.BOOL
+    user32.IsWindow.argtypes = [W.HWND]
+    user32.IsWindow.restype = W.BOOL
+    user32.GetWindowTextLengthW.argtypes = [W.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [W.HWND, W.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowThreadProcessId.argtypes = [W.HWND, ctypes.POINTER(W.DWORD)]
+    user32.GetWindowThreadProcessId.restype = W.DWORD
+    user32.ShowWindow.argtypes = [W.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = W.BOOL
+    user32.SetForegroundWindow.argtypes = [W.HWND]
+    user32.SetForegroundWindow.restype = W.BOOL
+    user32.BringWindowToTop.argtypes = [W.HWND]
+    user32.BringWindowToTop.restype = W.BOOL
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = W.HWND
+    user32.AttachThreadInput.argtypes = [W.DWORD, W.DWORD, W.BOOL]
+    user32.AttachThreadInput.restype = W.BOOL
+    user32.OpenClipboard.argtypes = [W.HWND]
+    user32.OpenClipboard.restype = W.BOOL
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = W.BOOL
+    user32.SetClipboardData.argtypes = [W.UINT, W.HANDLE]
+    user32.SetClipboardData.restype = W.HANDLE
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = W.BOOL
+    user32.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
+    user32.GetWindowRect.restype = W.BOOL
+    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user32.SetCursorPos.restype = W.BOOL
+    user32.SendInput.argtypes = [W.UINT, ctypes.POINTER(_Input), ctypes.c_int]
+    user32.SendInput.restype = W.UINT
+    user32.keybd_event.argtypes = [W.BYTE, W.BYTE, W.DWORD, ctypes.c_void_p]
+    user32.keybd_event.restype = None
+    user32.EnumWindows.argtypes = [_WNDENUMPROC, W.LPARAM]
+    user32.EnumWindows.restype = W.BOOL
+    kernel32.GlobalAlloc.argtypes = [W.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = W.HGLOBAL
+    kernel32.GlobalLock.argtypes = [W.HGLOBAL]
+    kernel32.GlobalLock.restype = W.LPVOID
+    kernel32.GlobalUnlock.argtypes = [W.HGLOBAL]
+    kernel32.GlobalUnlock.restype = W.BOOL
+    kernel32.GlobalFree.argtypes = [W.HGLOBAL]
+    kernel32.GlobalFree.restype = W.HGLOBAL
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = W.DWORD
+    _WIN32_DECLARED = True
+
+
 def _user32():
+    _declare_win32()
     return ctypes.windll.user32
+
+
+def _kernel32():
+    _declare_win32()
+    return ctypes.windll.kernel32
 
 
 def _is_login_window_title(title: str) -> bool:
@@ -508,11 +613,11 @@ def _window_process_image(hwnd: int) -> str | None:
     if os.name != 'nt':
         return None
     user32 = _user32()
+    kernel32 = _kernel32()
     process_id = wintypes.DWORD()
-    user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(process_id))
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
     if not process_id.value:
         return None
-    kernel32 = ctypes.windll.kernel32
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.QueryFullProcessImageNameW.argtypes = [
@@ -581,12 +686,12 @@ def _find_login_window(steam_exe: str) -> int:
                 found.append(hwnd)
         return True
 
-    user32.EnumWindows(ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(callback), 0)
+    user32.EnumWindows(_WNDENUMPROC(callback), 0)
     return found[0] if found else 0
 
 
 def _key(vk: int, up: bool = False) -> None:
-    _user32().keybd_event(vk, 0, 2 if up else 0, 0)
+    _user32().keybd_event(vk, 0, 2 if up else 0, None)
 
 
 def _press(vk: int) -> None:
@@ -596,11 +701,74 @@ def _press(vk: int) -> None:
     time.sleep(0.12)
 
 
+def _bring_to_foreground(hwnd: int, attempts: int = 12, delay: float = 0.4) -> bool:
+    """把登录窗口切到前台，失败会重试。
+
+    Windows 的前台锁会拒绝后台进程直接 SetForegroundWindow，这里依次尝试：
+    直接设置、先模拟一次 ALT 按键解锁、再把本线程输入队列临时附加到目标窗口线程。
+    都失败时返回 False——绝不在没有前台的情况下盲发按键，那会把密码打进别的窗口。
+    """
+    user32 = _user32()
+    kernel32 = _kernel32()
+    for _ in range(max(1, attempts)):
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+        user32.ShowWindow(hwnd, 9)
+        _key(_VK_MENU)
+        _key(_VK_MENU, True)
+        user32.SetForegroundWindow(hwnd)
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+        current_thread = kernel32.GetCurrentThreadId()
+        if target_thread and target_thread != current_thread:
+            if user32.AttachThreadInput(current_thread, target_thread, True):
+                try:
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+                finally:
+                    user32.AttachThreadInput(current_thread, target_thread, False)
+            if user32.GetForegroundWindow() == hwnd:
+                return True
+        time.sleep(delay)
+    return user32.GetForegroundWindow() == hwnd
+
+
+def _click_at(x: int, y: int) -> None:
+    """在屏幕坐标处点一下左键（SendInput，结构体按 64 位声明）。"""
+    user32 = _user32()
+    user32.SetCursorPos(int(x), int(y))
+    time.sleep(0.15)
+    for flag in (_MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP):
+        item = _Input(type=_INPUT_MOUSE, u=_InputUnion(mi=_MouseInput(0, 0, 0, flag, 0, None)))
+        user32.SendInput(1, ctypes.byref(item), ctypes.sizeof(_Input))
+        time.sleep(0.05)
+
+
+def _click_password_field(hwnd: int) -> bool:
+    """点一下登录窗口里的密码输入框，把键盘焦点确定地放进去。
+
+    CEF 登录页的焦点不一定在密码框（-login 预填失败、页面重绘、用户刚点过别处），
+    此时盲贴剪贴板会把密码粘进账号框，Steam 随后报“账号或密码错误”。旧版能登录正是靠
+    类似的点击/Tab 兜底，这里把这一步做成确定的一次点击。
+    """
+    rect = wintypes.RECT()
+    if not _user32().GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    if width <= 0 or height <= 0:
+        return False
+    _click_at(rect.left + int(width * 0.5), rect.top + int(height * 0.42))
+    return True
+
+
 def _set_clipboard(text: str) -> bool:
     """把文本放进剪贴板（Unicode），成功后由调用方负责清空。"""
-    user32, kernel32 = _user32(), ctypes.windll.kernel32
+    user32, kernel32 = _user32(), _kernel32()
     if not user32.OpenClipboard(None):
         return False
+    handle = None
     try:
         user32.EmptyClipboard()
         size = (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
@@ -608,10 +776,17 @@ def _set_clipboard(text: str) -> bool:
         if not handle:
             return False
         pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            return False
         ctypes.memmove(pointer, ctypes.create_unicode_buffer(text), size)
         kernel32.GlobalUnlock(handle)
-        return bool(user32.SetClipboardData(CF_UNICODETEXT, handle))
+        if user32.SetClipboardData(CF_UNICODETEXT, handle):
+            handle = None
+            return True
+        return False
     finally:
+        if handle:
+            kernel32.GlobalFree(handle)
         user32.CloseClipboard()
 
 
@@ -620,9 +795,9 @@ def _clear_clipboard() -> None:
 
 
 def _paste() -> None:
-    _key(0x11)          # Ctrl
-    _press(0x56)        # V
-    _key(0x11, True)
+    _key(_VK_CONTROL)
+    _press(_VK_V)
+    _key(_VK_CONTROL, True)
 
 
 def _wait_or_cancel(cancel_event: threading.Event | None, seconds: float) -> bool:
@@ -659,31 +834,33 @@ def automate_steam_login(
             _raise_if_login_cancelled(cancel_event)
     if not hwnd:
         return f'{int(timeout)} 秒内没有等到 Steam 登录窗口（可能已经用记住的登录信息直接进去了）'
-    user32.ShowWindow(hwnd, 9)
-    user32.SetForegroundWindow(hwnd)
-    # CEF 的窗口标题常会早于登录表单的可编辑控件出现。过早粘贴会落到浏览器容器或
-    # 账号框；多等一小段时间，让 Steam 根据 -login 预填账号并把焦点交给密码框。
+    user32 = _user32()
+    if not _bring_to_foreground(hwnd):
+        return 'Steam 登录窗口没能切到前台，已跳过自动填密码；请手动点一下 Steam 窗口后重试'
     if _wait_or_cancel(cancel_event, LOGIN_FORM_READY_DELAY):
         _raise_if_login_cancelled(cancel_event)
     if user32.GetForegroundWindow() != hwnd:
-        return 'Steam 登录窗口没能切到前台，已跳过自动填密码'
+        return 'Steam 登录窗口被其它窗口抢到前台，已跳过自动填密码'
     if not _set_clipboard(password):
         return '剪贴板不可用，已跳过自动填密码'
     try:
-        # 只提交一次。旧逻辑会在同一 CEF 窗口内再 Tab/点击并粘贴两次；而第一次提交后
-        # 页面可能已经显示错误/验证界面或切换焦点，重复粘贴会把正确密码变成错误登录尝试。
         _raise_if_login_cancelled(cancel_event)
+        # 先把焦点确定地放进密码框，再粘贴一次、只提交一次。旧版靠“Tab/点击 + 反复粘贴”
+        # 兜底；纯盲贴会在焦点仍处于账号框时把密码填进账号框，Steam 便报“账号或密码错误”。
+        _click_password_field(hwnd)
+        if _wait_or_cancel(cancel_event, 0.4):
+            _raise_if_login_cancelled(cancel_event)
         _paste()
         if _wait_or_cancel(cancel_event, 0.6):
             _raise_if_login_cancelled(cancel_event)
-        _press(0x0D)                         # Enter
+        _press(_VK_RETURN)
         attempts = max(1, int(LOGIN_SUBMIT_RESULT_WAIT))
         for _ in range(attempts):
             if _wait_or_cancel(cancel_event, 1.0):
                 _raise_if_login_cancelled(cancel_event)
             if not user32.IsWindow(hwnd):
                 return '已自动填入密码并提交'
-        return '已单次填入密码并提交；Steam 仍在登录窗口，请按提示完成 Steam Guard 或手动继续'
+        return '已填入密码并提交一次；Steam 仍停在登录窗口，请按提示完成 Steam Guard 或手动继续'
     finally:
         # 任一 Win32 调用异常、线程被上层捕获或登录窗口消失时都不能把密码留在剪贴板。
         _clear_clipboard()

@@ -1,7 +1,8 @@
 """Steam 封禁批量查询器（原生 Windows 桌面版）。
 
 用 SteamID64 和用户自己申请的 Steam Web API Key 查询 Steam 的公开封禁字段；
-账号、密码与 Key 只通过 Windows DPAPI 加密保存在本机，不会上传到任何服务器。
+账号密码按用户选择以明文保存在本机；Steam Web API Key 仍通过 Windows DPAPI 加密保存，
+两者都不会上传到任何服务器。
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.1.9"
+APP_VERSION = "3.2.0"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
@@ -352,10 +353,14 @@ def account_database_stats(path: Path) -> tuple[int, int] | None:
         total = connection.execute('SELECT COUNT(*) FROM accounts').fetchone()[0]
         # 老版本的表可能还没有密码列，这类库仍然可用（只是没有密码），不能当成"不是账号库"。
         column_names = {row[1] for row in connection.execute('PRAGMA table_info(accounts)')}
+        password_fields = [
+            field for field in ('password', 'password_enc') if field in column_names
+        ]
         with_password = 0
-        if 'password_enc' in column_names:
+        if password_fields:
+            where = ' OR '.join(f"{field} IS NOT NULL AND {field} <> ''" for field in password_fields)
             with_password = connection.execute(
-                "SELECT COUNT(*) FROM accounts WHERE password_enc IS NOT NULL AND password_enc <> ''"
+                f"SELECT COUNT(*) FROM accounts WHERE {where}"
             ).fetchone()[0]
         return int(total), int(with_password)
     except (OSError, sqlite3.Error):
@@ -632,8 +637,8 @@ def merge_legacy_user_data(legacy_directory: Path, data_directory: Path) -> dict
     """把旧账号库安全合并进当前库，而不是把当前库整体覆盖掉。
 
     同 SteamID64 的当前数据优先，仅填补空的账号名、备注、密码、查询结果和登录时间；
-    同名占位行在没有真实 ID 冲突时会原地升级。旧密码密文必须能由当前 Windows 用户解密，
-    否则不会被带入当前库。
+    同名占位行在没有真实 ID 冲突时会原地升级。v3.1.x 的旧密码密文会先由当前
+    Windows 用户解密，再作为 v3.2 的明文密码带入；无法解密的旧密文不会覆盖当前库。
     """
     legacy_directory = legacy_directory.resolve()
     data_directory = data_directory.resolve()
@@ -663,7 +668,7 @@ def merge_legacy_user_data(legacy_directory: Path, data_directory: Path) -> dict
         source_columns = _table_columns(source, 'accounts')
         selected_columns = [
             column for column in (
-                'account_name', 'steam_id', 'note', 'password_enc',
+                'account_name', 'steam_id', 'note', 'password', 'password_enc',
                 *AUTO_MERGE_QUERY_COLUMNS, *AUTO_MERGE_ACTIVITY_COLUMNS,
             ) if column in source_columns
         ]
@@ -682,13 +687,14 @@ def merge_legacy_user_data(legacy_directory: Path, data_directory: Path) -> dict
                 values['steam_id'] = steam_id
                 values['account_name'] = str(values.get('account_name') or '').strip()
                 values['note'] = str(values.get('note') or '').strip()
+                password = str(values.get('password') or '')
                 encrypted_password = str(values.get('password_enc') or '')
-                if encrypted_password and not AccountStore._decrypt_password(encrypted_password):
-                    # DPAPI 密文来自其它 Windows 用户/旧系统时不可用，绝不因为“非空”而覆盖当前库。
-                    values['password_enc'] = ''
-                    result['unreadable_passwords'] += 1
-                else:
-                    values['password_enc'] = encrypted_password
+                if not password and encrypted_password:
+                    password = AccountStore._decrypt_legacy_password(encrypted_password)
+                    if not password:
+                        # DPAPI 密文来自其它 Windows 用户/旧系统时不可用，绝不因为“非空”而覆盖当前库。
+                        result['unreadable_passwords'] += 1
+                values['password'] = password
 
                 source_has_real_id = bool(STEAM_ID_PATTERN.fullmatch(steam_id))
                 current = destination.execute(
@@ -724,7 +730,7 @@ def merge_legacy_user_data(legacy_directory: Path, data_directory: Path) -> dict
                         'account_name': values['account_name'],
                         'steam_id': steam_id,
                         'note': values['note'],
-                        'password_enc': values['password_enc'],
+                        'password': values['password'],
                         'status': str(values.get('status') or '未查询'),
                         'query_error': str(values.get('query_error') or ''),
                     }
@@ -738,15 +744,15 @@ def merge_legacy_user_data(legacy_directory: Path, data_directory: Path) -> dict
                         [insert[column] for column in columns],
                     )
                     result['accounts_added'] += 1
-                    if values['password_enc']:
+                    if values['password']:
                         result['passwords_filled'] += 1
                     continue
 
                 updates: dict[str, Any] = {}
-                for column in ('account_name', 'note', 'password_enc'):
+                for column in ('account_name', 'note', 'password'):
                     if column in values and _nonempty(values[column]) and not _nonempty(current[column]):
                         updates[column] = values[column]
-                if 'password_enc' in updates:
+                if 'password' in updates:
                     result['passwords_filled'] += 1
 
                 # 当前已经查询过时，保留它的查询状态；当前从未查询才用旧库结果补齐。
@@ -1139,12 +1145,12 @@ def import_record(row: list[str], layout: CsvLayout) -> tuple[str, str, str, str
 
 class AccountStore:
     UPSERT_SQL = """
-        INSERT INTO accounts (account_name, steam_id, note, password_enc)
+        INSERT INTO accounts (account_name, steam_id, note, password)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(steam_id) DO UPDATE SET
             account_name=COALESCE(NULLIF(excluded.account_name, ''), accounts.account_name),
             note=COALESCE(NULLIF(excluded.note, ''), accounts.note),
-            password_enc=COALESCE(NULLIF(excluded.password_enc, ''), accounts.password_enc)
+            password=COALESCE(NULLIF(excluded.password, ''), accounts.password)
     """
 
     def __init__(self, db_path: Path):
@@ -1181,7 +1187,7 @@ class AccountStore:
                 checked_at TEXT,
                 status TEXT NOT NULL DEFAULT '未查询',
                 query_error TEXT NOT NULL DEFAULT '',
-                password_enc TEXT NOT NULL DEFAULT '',
+                password TEXT NOT NULL DEFAULT '',
                 last_login_at TEXT,
                 last_logout_at TEXT
             );
@@ -1193,31 +1199,47 @@ class AccountStore:
             );
             """)
         existing = {row[1] for row in connection.execute('PRAGMA table_info(accounts)')}
-        if 'password_enc' not in existing:
-            connection.execute("ALTER TABLE accounts ADD COLUMN password_enc TEXT NOT NULL DEFAULT ''")
+        if 'password' not in existing:
+            connection.execute("ALTER TABLE accounts ADD COLUMN password TEXT NOT NULL DEFAULT ''")
         if 'last_login_at' not in existing:
             connection.execute("ALTER TABLE accounts ADD COLUMN last_login_at TEXT")
         if 'last_logout_at' not in existing:
             connection.execute("ALTER TABLE accounts ADD COLUMN last_logout_at TEXT")
+        # v3.1.x 的 password_enc 是当前 Windows 用户 DPAPI 密文。v3.2 起密码改为可见明文，
+        # 打开旧库时把能解开的密文迁到 password 列；旧密文保留不删，回退旧版本仍可用。
+        if 'password_enc' in existing:
+            AccountStore._migrate_legacy_passwords_to_plaintext(connection)
         connection.execute('CREATE INDEX IF NOT EXISTS idx_accounts_last_login ON accounts(last_login_at DESC)')
         connection.commit()
 
     @staticmethod
-    def _encrypt_password(password: str) -> str:
-        """用当前 Windows 用户的 DPAPI 加密 Steam 密码，空密码返回空串。"""
-        if not password:
-            return ''
-        return base64.b64encode(DpapiKeyStore._protect(password.encode('utf-8'))).decode('ascii')
-
-    @staticmethod
-    def _decrypt_password(password_enc: str) -> str:
-        """解密入库的 Steam 密码；密文损坏或换了 Windows 用户时返回空串而不是崩溃。"""
+    def _decrypt_legacy_password(password_enc: str) -> str:
+        """仅用于把 v3.1.x DPAPI 密文迁到 v3.2 的明文密码列。"""
         if not password_enc:
             return ''
         try:
             return DpapiKeyStore._unprotect(base64.b64decode(password_enc)).decode('utf-8')
         except (ValueError, UnicodeDecodeError, KeyStorageError):
             return ''
+
+    @staticmethod
+    def _migrate_legacy_passwords_to_plaintext(connection: sqlite3.Connection) -> None:
+        """原地迁出当前用户可解开的 v3.1.x 密文，不覆盖已有明文密码。"""
+        rows = connection.execute(
+            "SELECT id, password, password_enc FROM accounts"
+            " WHERE (password IS NULL OR password = '')"
+            " AND password_enc IS NOT NULL AND password_enc <> ''"
+        ).fetchall()
+        for row in rows:
+            plain_password = str(row['password'] or '')
+            if not plain_password:
+                plain_password = AccountStore._decrypt_legacy_password(str(row['password_enc'] or ''))
+            if plain_password:
+                # 旧密文保留不删：万一回退到 v3.1.x，那边仍然读得到密码。
+                connection.execute(
+                    "UPDATE accounts SET password=? WHERE id=?",
+                    (plain_password, int(row['id'])),
+                )
 
     @staticmethod
     def _risk_where() -> str:
@@ -1374,7 +1396,7 @@ class AccountStore:
         cancel_event: threading.Event,
         progress: Callable[[dict[str, Any]], None],
     ) -> dict[str, Any]:
-        """导入 CSV / JSON / TXT（账号----密码），按批提交；密码用 DPAPI 加密后与账号一起保存。"""
+        """导入 CSV / JSON / TXT（账号----密码），按批提交；密码以可见明文保存。"""
         kind = detect_import_format(source_path)
         if kind == 'json':
             return AccountStore._import_json(db_path, source_path, cancel_event, progress)
@@ -1397,7 +1419,7 @@ class AccountStore:
 
     @staticmethod
     def _store_records(connection, stats: dict, records: list) -> None:
-        """把一批记录加密后写库（records 为 (账号, ID/占位, 备注, 密码)）。"""
+        """把一批记录写入明文密码列（records 为 (账号, ID/占位, 备注, 密码)）。"""
         if not records:
             return
         # CSV / JSON / TXT 共用同一合并逻辑。整个批次在一个事务内完成，既保留
@@ -1412,7 +1434,7 @@ class AccountStore:
                     steam_id = placeholder_for(account_name)
                 if password:
                     stats['passwords_saved'] += 1
-                password_enc = AccountStore._encrypt_password(password)
+                password = password or ''
                 real_id = bool(STEAM_ID_PATTERN.fullmatch(steam_id))
                 existing = None
                 if account_name:
@@ -1426,12 +1448,12 @@ class AccountStore:
                     if taken is None or int(taken['id']) == int(existing['id']):
                         connection.execute(
                             'UPDATE accounts SET steam_id=?, note=?,'
-                            " password_enc=COALESCE(NULLIF(?, ''), password_enc) WHERE id=?",
-                            (target, note, password_enc, int(existing['id'])),
+                            " password=COALESCE(NULLIF(?, ''), password) WHERE id=?",
+                            (target, note, password, int(existing['id'])),
                         )
                         stats['imported'] += 1
                         continue
-                connection.execute(AccountStore.UPSERT_SQL, (account_name, steam_id, note, password_enc))
+                connection.execute(AccountStore.UPSERT_SQL, (account_name, steam_id, note, password))
                 stats['imported'] += 1
 
     @staticmethod
@@ -1618,9 +1640,9 @@ class AccountStore:
         steam_id = normalize_steam_id(steam_id)
         account_name = account_name.strip()
         note = note.strip()
-        password_enc = self._encrypt_password(password)
+        password = password or ''
         if account_id is None:
-            self.connection.execute(self.UPSERT_SQL, (account_name, steam_id, note, password_enc))
+            self.connection.execute(self.UPSERT_SQL, (account_name, steam_id, note, password))
             created_id = self.connection.execute(
                 'SELECT id FROM accounts WHERE steam_id=?',
                 (steam_id,),
@@ -1628,22 +1650,22 @@ class AccountStore:
         else:
             self.connection.execute(
                 "UPDATE accounts SET account_name=?, steam_id=?, note=?,"
-                " password_enc=COALESCE(NULLIF(?, ''), password_enc) WHERE id=?",
-                (account_name, steam_id, note, password_enc, account_id),
+                " password=COALESCE(NULLIF(?, ''), password) WHERE id=?",
+                (account_name, steam_id, note, password, account_id),
             )
             created_id = account_id
         self.connection.commit()
         return int(created_id)
 
     def account_password(self, account_id: int) -> str:
-        """取出某个账号保存的 Steam 密码（DPAPI 解密）；没有保存或解密失败时返回空串。"""
+        """取出某个账号保存的可见 Steam 密码；没有保存时返回空串。"""
         row = self.connection.execute(
-            'SELECT password_enc FROM accounts WHERE id=?',
+            'SELECT password FROM accounts WHERE id=?',
             (int(account_id),),
         ).fetchone()
         if row is None:
             return ''
-        return self._decrypt_password(row['password_enc'])
+        return str(row['password'] or '')
 
     def update_steam_id(self, account_id: int, steam_id: str) -> bool:
         """解析出真实 SteamID64 后写回。
@@ -1652,26 +1674,26 @@ class AccountStore:
         """
         steam_id = normalize_steam_id(steam_id)
         existing = self.connection.execute(
-            'SELECT id, account_name, note, password_enc FROM accounts WHERE steam_id=?', (steam_id,)
+            'SELECT id, account_name, note, password FROM accounts WHERE steam_id=?', (steam_id,)
         ).fetchone()
         if existing is not None and int(existing['id']) != int(account_id):
             with self.connection:
                 # 占位行（只有账号+密码）解析成功后要并进真ID行：先把占位行比真ID行更全的字段补过去，
                 # 否则用户辛苦导入的密码、备注、账号标签会随着占位行一起被删掉。
                 placeholder = self.connection.execute(
-                    'SELECT account_name, note, password_enc FROM accounts WHERE id=?', (int(account_id),)
+                    'SELECT account_name, note, password FROM accounts WHERE id=?', (int(account_id),)
                 ).fetchone()
                 if placeholder is not None:
                     self.connection.execute(
                         "UPDATE accounts SET"
                         " account_name=COALESCE(NULLIF(account_name, ''), ?),"
                         " note=COALESCE(NULLIF(note, ''), ?),"
-                        " password_enc=COALESCE(NULLIF(password_enc, ''), ?)"
+                        " password=COALESCE(NULLIF(password, ''), ?)"
                         " WHERE id=?",
                         (
                             placeholder['account_name'] or '',
                             placeholder['note'] or '',
-                            placeholder['password_enc'] or '',
+                            placeholder['password'] or '',
                             int(existing['id']),
                         ),
                     )
@@ -1746,11 +1768,11 @@ class AccountStore:
         self.save_results_batch([(account_id, player, error)])
 
     def export_account_rows(self, account_ids: Iterable[int] | None = None, mode: str = 'all') -> Iterator[tuple]:
-        """导出账号（账号名、SteamID64、备注、解密后的密码）。
+        """导出账号（账号名、SteamID64、备注和明文密码）。
 
         指定 account_ids 时按所选账号导出；未指定时可按 risk/safe 筛选导出，默认导出全部。
         """
-        columns = 'SELECT account_name, steam_id, note, password_enc FROM accounts'
+        columns = 'SELECT account_name, steam_id, note, password FROM accounts'
         if account_ids is None:
             cursor = self.connection.execute(
                 f'{columns} {self._mode_where(mode)} ORDER BY account_name COLLATE NOCASE, steam_id'
@@ -1765,10 +1787,10 @@ class AccountStore:
                     f'{columns} WHERE id IN ({marks}) ORDER BY account_name COLLATE NOCASE, steam_id', chunk
                 )
                 for row in cursor:
-                    yield (row['account_name'], row['steam_id'], row['note'], self._decrypt_password(row['password_enc']))
+                    yield (row['account_name'], row['steam_id'], row['note'], row['password'] or '')
             return
         for row in cursor:
-            yield (row['account_name'], row['steam_id'], row['note'], self._decrypt_password(row['password_enc']))
+            yield (row['account_name'], row['steam_id'], row['note'], row['password'] or '')
 
     def export_rows(self) -> Iterator[sqlite3.Row]:
         cursor = self.connection.execute("""
@@ -2460,10 +2482,10 @@ class AccountDialog:
         ttk.Label(frame, text='备注（可选）').grid(row=2, column=0, sticky='w', pady=7)
         ttk.Entry(frame, textvariable=self.note_var, width=42).grid(row=2, column=1, sticky='ew', pady=7)
         ttk.Label(frame, text='Steam 密码（自动登录用）').grid(row=3, column=0, sticky='w', pady=7)
-        ttk.Entry(frame, textvariable=self.password_var, width=42, show='*').grid(row=3, column=1, sticky='ew', pady=7)
+        ttk.Entry(frame, textvariable=self.password_var, width=42).grid(row=3, column=1, sticky='ew', pady=7)
         ttk.Label(
             frame,
-            text='密码以当前 Windows 用户的 DPAPI 加密后保存在本机数据库，仅用于自动登录 Steam。',
+            text='密码以可见明文保存在本机账号库，也会显示在账号列表中。请勿将账号库、截图或导出文件发给他人。',
             foreground='#64748b',
             wraplength=390,
         ).grid(row=4, column=0, columnspan=2, sticky='w', pady=(8, 14))
@@ -2614,6 +2636,7 @@ class SteamBanApp:
     columns = (
         ("pick", "选择", 52),
         ("account_name", "账号标签", 150),
+        ("password", "密码（明文）", 180),
         ("steam_id", "SteamID64", 175),
         ("login_elapsed", "上次登录", 155),
         ("vac", "VAC", 55),
@@ -2777,8 +2800,8 @@ class SteamBanApp:
         ttk.Label(sidebar, text="  API Key 本机加密保存", style="SidebarHint.TLabel").pack(anchor="w", pady=(7, 0))
         ttk.Frame(sidebar, style="Sidebar.TFrame").pack(fill="both", expand=True)
         ttk.Separator(sidebar, orient="horizontal", bootstyle="secondary").pack(fill="x", pady=(0, 15))
-        ttk.Label(sidebar, text="安全设计", style="SidebarKicker.TLabel").pack(anchor="w")
-        ttk.Label(sidebar, text="支持 CSV / JSON / TXT（账号----密码）；密码用本机 DPAPI 加密保存。", style="SidebarHint.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
+        ttk.Label(sidebar, text="本地保存说明", style="SidebarKicker.TLabel").pack(anchor="w")
+        ttk.Label(sidebar, text="支持 CSV / JSON / TXT（账号----密码）；密码会以可见明文保存并显示在列表。不要外发数据库、截图或导出文件。", style="SidebarHint.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
         ttk.Label(sidebar, text="只有账号密码也能用：查询时自动解析 SteamID64。", style="SidebarHint.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
         ttk.Label(sidebar, text="双击账号 = 直接登录；右键 = 登录/编辑/删除。", style="SidebarHint.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
 
@@ -2980,7 +3003,7 @@ class SteamBanApp:
         self.tree = ttk.Treeview(table_frame, columns=names, show="headings", selectmode="extended", style="Account.Treeview")
         for name, label, width in self.columns:
             self.tree.heading(name, text=label)
-            self.tree.column(name, width=width, minwidth=45, anchor="center" if name not in {"note", "account_name", "pubg"} else "w")
+            self.tree.column(name, width=width, minwidth=45, anchor="center" if name not in {"note", "account_name", "password", "pubg"} else "w")
         self.tree.tag_configure("risk", background="#fff1f2")
         self.tree.tag_configure("success", background="#f0fdf4")
         self.tree.tag_configure("failure", background="#fff7ed")
@@ -3376,6 +3399,7 @@ class SteamBanApp:
         values = (
             "■" if row["id"] in self.checked_ids else "□",
             row["account_name"],
+            row["password"] or "",
             row["steam_id"] if STEAM_ID_PATTERN.fullmatch(row["steam_id"] or "") else "未解析（查询时自动获取）",
             login_elapsed_label(row["last_logout_at"], row["last_login_at"]),
             bool_label(row["vac_banned"]),
@@ -4158,7 +4182,7 @@ def run_self_test() -> None:
         assert is_account_database(old_schema_path) is True
         old_schema_store = AccountStore(old_schema_path)
         assert old_schema_store.count_accounts() == 1
-        assert 'password_enc' in {row[1] for row in old_schema_store.connection.execute('PRAGMA table_info(accounts)')}
+        assert 'password' in {row[1] for row in old_schema_store.connection.execute('PRAGMA table_info(accounts)')}
         old_schema_store.close()
 
         # 自动迁移只能合并：当前账号、查询结果和备注都保留，旧库仅补密码并添加此前不存在的账号。
@@ -4194,7 +4218,7 @@ def run_self_test() -> None:
             AccountStore.UPSERT_SQL,
             (
                 '反向占位账号', placeholder_for('反向占位账号'), '旧库有密码',
-                merge_legacy._encrypt_password('reverse-password'),
+                'reverse-password',
             ),
         )
         merge_legacy.connection.commit()
@@ -4257,7 +4281,7 @@ def run_self_test() -> None:
         # 占位账号解析成功后合并：密码/备注/标签要并进真 ID 行，不能随占位行一起被删掉。
         upsert_store.connection.execute(
             AccountStore.UPSERT_SQL,
-            ("占位账号", placeholder_for("占位账号"), "占位备注", upsert_store._encrypt_password("secret")),
+            ("占位账号", placeholder_for("占位账号"), "占位备注", "secret"),
         )
         upsert_store.connection.commit()
         placeholder_id = upsert_store.connection.execute(
@@ -4327,6 +4351,8 @@ def run_self_test() -> None:
             pass
         # CEF 登录页的密码只能安全提交一次：后续 Tab/点击/粘贴会在页面状态已变化时破坏
         # 第一次正确提交。这里模拟窗口关闭，确认不再发送第二次粘贴、Tab 或 Enter。
+        login_steps: list[tuple[str, Any]] = []
+
         class FakeLoginWindow:
             def ShowWindow(self, _hwnd, _command):
                 return 1
@@ -4340,7 +4366,19 @@ def run_self_test() -> None:
             def IsWindow(self, _hwnd):
                 return False
 
-        login_steps: list[tuple[str, Any]] = []
+            def GetWindowRect(self, _hwnd, rect_pointer):
+                rect = ctypes.cast(rect_pointer, ctypes.POINTER(ctypes.wintypes.RECT)).contents
+                rect.left, rect.top, rect.right, rect.bottom = 100, 200, 800, 640
+                return 1
+
+            def SetCursorPos(self, x, y):
+                login_steps.append(('cursor', (x, y)))
+                return 1
+
+            def SendInput(self, _count, _pointer, _size):
+                login_steps.append(('click', None))
+                return 1
+
         saved_user32 = steam_login._user32
         saved_find_login_window = steam_login._find_login_window
         saved_set_clipboard = steam_login._set_clipboard
@@ -4368,6 +4406,11 @@ def run_self_test() -> None:
         assert login_steps.count(('paste', None)) == 1
         assert [value for kind, value in login_steps if kind == 'press'] == [0x0D]
         assert ('clipboard', 'single-submit-password') in login_steps and ('clear', None) in login_steps
+        # 必须先把焦点点进密码框，再粘贴、最后回车（顺序错了密码就会粘进账号框）。
+        login_kinds = [kind for kind, _value in login_steps]
+        assert ('cursor', (450, 384)) in login_steps
+        assert login_kinds.count('click') == 2
+        assert login_kinds.index('cursor') < login_kinds.index('paste') < login_kinds.index('press')
         # 主接口网络失败 + 备用主机 403 时，不能报成“Key 被撤销”。
         saved_urlopen = globals()['urlopen']
 
@@ -4461,7 +4504,9 @@ def run_self_test() -> None:
         first = rows[0]
         expected_password = f"pw-{int(first['steam_id']) - 76561198000000000}"
         assert large_store.account_password(int(first["id"])) == expected_password
-        assert expected_password not in (root / "large.sqlite3").read_text(encoding="latin-1")
+        # v3.2.0 起按用户要求取消密码加密：密码以可见明文入库，因此这里反过来断言库中可读到它。
+        # 数据库文件本身就是敏感文件，程序会在界面上明确提示不要外发账号库、截图或导出文件。
+        assert expected_password in (root / "large.sqlite3").read_text(encoding="latin-1")
         large_store.close()
 
         # CSV：支持账号+密码、没有 SteamID64 的表头格式；导入后保留占位 ID。
