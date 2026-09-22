@@ -34,7 +34,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.1.1"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
@@ -858,6 +858,11 @@ def id_chunks(values: Iterable[int], size: int = SQL_VARIABLE_CHUNK) -> Iterator
             chunk = []
     if chunk:
         yield chunk
+
+
+def mask_password(password: str | None) -> str:
+    """账号列表里默认不显示明文密码，只显示固定长度圆点（不泄露真实长度）。"""
+    return '••••••••' if password else ''
 
 
 def utc_now() -> str:
@@ -2477,6 +2482,7 @@ class AccountDialog:
         self.steam_var = StringVar(value=initial.steam_id if initial else '')
         self.note_var = StringVar(value=initial.note if initial else '')
         self.password_var = StringVar(value=password)
+        self.show_password_var = BooleanVar(value=False)
 
         frame = ttk.Frame(self.window, padding=18)
         frame.grid(sticky='nsew')
@@ -2488,15 +2494,23 @@ class AccountDialog:
         ttk.Label(frame, text='备注（可选）').grid(row=2, column=0, sticky='w', pady=7)
         ttk.Entry(frame, textvariable=self.note_var, width=42).grid(row=2, column=1, sticky='ew', pady=7)
         ttk.Label(frame, text='Steam 密码（自动登录用）').grid(row=3, column=0, sticky='w', pady=7)
-        ttk.Entry(frame, textvariable=self.password_var, width=42).grid(row=3, column=1, sticky='ew', pady=7)
+        password_entry = ttk.Entry(frame, textvariable=self.password_var, width=42, show='●')
+        password_entry.grid(row=3, column=1, sticky='ew', pady=7)
+
+        def _toggle_password_show() -> None:
+            password_entry.configure(show='' if self.show_password_var.get() else '●')
+
+        ttk.Checkbutton(
+            frame, text='显示密码', variable=self.show_password_var, command=_toggle_password_show,
+        ).grid(row=4, column=1, sticky='w', pady=(0, 4))
         ttk.Label(
             frame,
-            text='密码以可见明文保存在本机账号库，也会显示在账号列表中。请勿将账号库、截图或导出文件发给他人。',
+            text='密码保存在本机账号库，列表中默认用圆点隐藏，可点「显示密码」查看。请勿将账号库、截图或导出文件发给他人。',
             foreground='#64748b',
             wraplength=390,
-        ).grid(row=4, column=0, columnspan=2, sticky='w', pady=(8, 14))
+        ).grid(row=5, column=0, columnspan=2, sticky='w', pady=(8, 14))
         controls = ttk.Frame(frame)
-        controls.grid(row=5, column=0, columnspan=2, sticky='e')
+        controls.grid(row=6, column=0, columnspan=2, sticky='e')
         ttk.Button(controls, text='取消', command=self.window.destroy).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(controls, text='保存', command=self._save).grid(row=0, column=1)
         self.window.bind('<Escape>', lambda _event: self.window.destroy())
@@ -2642,7 +2656,7 @@ class SteamBanApp:
     columns = (
         ("pick", "选择", 52),
         ("account_name", "账号标签", 150),
-        ("password", "密码（明文）", 180),
+        ("password", "密码", 150),
         ("steam_id", "SteamID64", 175),
         ("login_elapsed", "上次登录", 155),
         ("vac", "VAC", 55),
@@ -2693,7 +2707,7 @@ class SteamBanApp:
                         f'{key_suffix}（来源：{source_text}{extra_sources}）。当前账号与查询记录已保留。'
                     )
         except (OSError, sqlite3.Error, ValueError) as exc:
-            migration_notice = f'未能自动合并旧版数据：{exc}；可点击“迁移旧版数据”手动选择账号库。'
+            migration_notice = f'未能自动合并旧版数据：{exc}。'
         self.store = AccountStore(self.database_path)
         cleared_key_failures = self.store.clear_rejected_key_failures()
         self.key_store = DpapiKeyStore(self.settings_path)
@@ -2725,6 +2739,7 @@ class SteamBanApp:
                     else "就绪：请添加或导入 SteamID64，然后输入自己的 Steam Web API Key。")
             )
         )
+        self.show_password_var = BooleanVar(value=False)
         self.count_var = StringVar(value="0 个账号")
         self.list_hint_var = StringVar(value="正在准备账号清单…")
         self.query_progress_var = StringVar(value="")
@@ -2807,7 +2822,7 @@ class SteamBanApp:
         ttk.Frame(sidebar, style="Sidebar.TFrame").pack(fill="both", expand=True)
         ttk.Separator(sidebar, orient="horizontal", bootstyle="secondary").pack(fill="x", pady=(0, 15))
         ttk.Label(sidebar, text="本地保存说明", style="SidebarKicker.TLabel").pack(anchor="w")
-        ttk.Label(sidebar, text="支持 CSV / JSON / TXT（账号----密码）；密码会以可见明文保存并显示在列表。不要外发数据库、截图或导出文件。", style="SidebarHint.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
+        ttk.Label(sidebar, text="支持 CSV / JSON / TXT（账号----密码）；密码保存在本机账号库，列表里默认用圆点隐藏，点「显示密码」可查看。不要外发数据库、截图或导出文件。", style="SidebarHint.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
         ttk.Label(sidebar, text="只有账号密码也能用：查询时自动解析 SteamID64。", style="SidebarHint.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
         ttk.Label(sidebar, text="双击账号 = 直接登录；右键 = 登录/编辑/删除。", style="SidebarHint.TLabel", justify="left").pack(anchor="w", pady=(6, 0))
 
@@ -2915,8 +2930,6 @@ class SteamBanApp:
         account_actions = ttk.Frame(actions, style="Card.TFrame")
         account_actions.pack(side="left")
         ttk.Label(account_actions, text="账号库", style="SectionTitle.TLabel").pack(side="left", padx=(0, 12))
-        self.add_button = ttk.Button(account_actions, text="添加账号", command=self.add_account, bootstyle="primary-outline")
-        self.add_button.pack(side="left")
         self.edit_button = ttk.Button(account_actions, text="编辑所选", command=self.edit_selected, bootstyle="secondary-outline")
         self.edit_button.pack(side="left", padx=(8, 0))
         self.delete_button = ttk.Button(account_actions, text="删除所选", command=self.delete_selected, bootstyle="danger-outline")
@@ -2927,13 +2940,6 @@ class SteamBanApp:
         self.paste_import_button.pack(side="left", padx=(8, 0))
         self.import_button = ttk.Button(account_actions, text="导入文件 (CSV / JSON / TXT)", command=self.import_accounts, bootstyle="info-outline")
         self.import_button.pack(side="left", padx=(14, 0))
-        self.migrate_legacy_button = ttk.Button(
-            account_actions,
-            text="迁移旧版数据",
-            command=self.migrate_legacy_data,
-            bootstyle="secondary-outline",
-        )
-        self.migrate_legacy_button.pack(side="left", padx=(8, 0))
         self.cancel_import_button = ttk.Button(
             account_actions,
             text="取消导入",
@@ -2942,8 +2948,6 @@ class SteamBanApp:
             state="disabled",
         )
         self.cancel_import_button.pack(side="left", padx=(8, 0))
-        self.export_button = ttk.Button(account_actions, text="导出结果", command=self.export_results, bootstyle="secondary-outline")
-        self.export_button.pack(side="left", padx=(8, 0))
         self.export_accounts_button = ttk.Button(
             account_actions, text="导出账号", command=self.export_accounts, bootstyle="secondary-outline"
         )
@@ -2993,6 +2997,11 @@ class SteamBanApp:
             bootstyle="success",
         )
         self.safe_filter_button.pack(side="right", padx=(0, 8))
+        self.show_password_button = ttk.Checkbutton(
+            table_header, text="显示密码", variable=self.show_password_var,
+            command=self._toggle_password_visibility, bootstyle="info",
+        )
+        self.show_password_button.pack(side="right", padx=(8, 0))
         self.clear_checked_button = ttk.Button(
             table_header, text="清空勾选", command=lambda: self._set_all_checked(False),
             bootstyle="secondary-outline", width=10,
@@ -3081,6 +3090,23 @@ class SteamBanApp:
         self.remember_key_var.set(False)
         self.key_state_var.set("仅本次运行")
         self.status_var.set("已清除本机加密保存的 API Key。")
+
+    def _toggle_password_visibility(self) -> None:
+        """原地切换密码列显示，避免重建列表导致长列表跳回顶部。"""
+        show = self.show_password_var.get()
+        items = [int(item) for item in self.tree.get_children()]
+        if not items:
+            return
+        values: dict[int, str] = {}
+        for chunk in id_chunks(items):
+            marks = ','.join('?' for _ in chunk)
+            rows = self.store.connection.execute(
+                f'SELECT id, password FROM accounts WHERE id IN ({marks})', chunk
+            ).fetchall()
+            values.update({int(row['id']): (row['password'] or '') for row in rows})
+        for item in items:
+            value = values.get(item, '')
+            self.tree.set(str(item), 'password', value if show else mask_password(value))
 
     def _schedule_login_timer_refresh(self) -> None:
         """小时数会跨整点变化；下一整点只更新已加载行的计时单元格。"""
@@ -3356,12 +3382,9 @@ class SteamBanApp:
     def _set_controls(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
         for widget in (
-            self.add_button,
             self.edit_button,
             self.delete_button,
             self.import_button,
-            self.migrate_legacy_button,
-            self.export_button,
             self.export_accounts_button,
             self.select_all_button,
             self.clear_checked_button,
@@ -3417,7 +3440,7 @@ class SteamBanApp:
         values = (
             "■" if row["id"] in self.checked_ids else "□",
             row["account_name"],
-            row["password"] or "",
+            row["password"] if self.show_password_var.get() else mask_password(row["password"]),
             row["steam_id"] if STEAM_ID_PATTERN.fullmatch(row["steam_id"] or "") else "未解析（查询时自动获取）",
             login_elapsed_label(row["last_logout_at"], row["last_login_at"]),
             bool_label(row["vac_banned"]),
@@ -3544,7 +3567,7 @@ class SteamBanApp:
         try:
             merge_results = [merge_legacy_user_data(path.parent, self.data_dir) for path in source_databases]
         except (OSError, sqlite3.Error, ValueError) as exc:
-            self.status_var.set(f"已自动找到旧版账号库，但合并失败：{exc}；可点击“迁移旧版数据”手动处理。")
+            self.status_var.set(f"已自动找到旧版账号库，但合并失败：{exc}。")
             return False
 
         added = sum(result['accounts_added'] for result in merge_results)
@@ -3571,82 +3594,6 @@ class SteamBanApp:
             f"{key_suffix}（来源：{source_text}{extra_sources}）。当前账号与查询记录已保留。{key_problem}"
         )
         return True
-
-    def migrate_legacy_data(self) -> None:
-        """供旧版位于非常规目录的用户手动选择并迁移其账号库。"""
-        if self.query_running or self.import_running or self.login_running:
-            self.status_var.set("请等待当前查询、导入或登录完成后再迁移旧版数据。")
-            return
-        selected_path = filedialog.askopenfilename(
-            title="选择旧版 steam_ban_accounts.sqlite3",
-            initialdir=str(self.install_dir),
-            filetypes=[("旧版账号库", "steam_ban_accounts.sqlite3"), ("SQLite 数据库", "*.sqlite3"), ("所有文件", "*.*")],
-            parent=self.root,
-        )
-        if not selected_path:
-            return
-        source_database = Path(selected_path).resolve()
-        if source_database.name != ACCOUNT_DATABASE_FILENAME:
-            messagebox.showerror(
-                APP_NAME,
-                f"请选择旧版的 {ACCOUNT_DATABASE_FILENAME}，而不是其它 SQLite 文件。",
-                parent=self.root,
-            )
-            return
-        if not is_account_database(source_database):
-            messagebox.showerror(APP_NAME, "所选文件不是本软件可识别的旧版账号库。", parent=self.root)
-            return
-        if source_database == self.database_path.resolve():
-            messagebox.showinfo(APP_NAME, "这就是当前正在使用的账号库，无需迁移。", parent=self.root)
-            return
-        current_count = self.store.count_accounts()
-        if current_count and not messagebox.askyesno(
-            APP_NAME,
-            f"当前共享账号库已有 {current_count} 条记录。迁移会以所选旧版账号库替换它，并自动备份当前库。继续吗？",
-            parent=self.root,
-        ):
-            return
-
-        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        backup_path = self.data_dir / f"steam_ban_accounts.before-migration-{timestamp}.sqlite3"
-        self.store.close()
-        try:
-            if self.database_path.exists():
-                copy_sqlite_database(self.database_path, backup_path)
-            migrated_database, migrated_settings = migrate_legacy_user_data(
-                source_database.parent,
-                self.data_dir,
-                replace_database=True,
-                replace_settings=True,
-            )
-            if not migrated_database:
-                raise FileNotFoundError(f"未找到 {ACCOUNT_DATABASE_FILENAME}")
-            self.store = AccountStore(self.database_path)
-            saved_api_key = self.key_store.load()
-            self.api_key_var.set(saved_api_key or '')
-            self.remember_key_var.set(bool(saved_api_key))
-            self.key_state_var.set("已加密保存" if saved_api_key else "仅本次运行")
-            self.checked_ids.clear()
-            self.refresh_table()
-            key_suffix = '和已保存的 Key' if migrated_settings else ''
-            self.status_var.set(
-                f"已迁移旧版账号库{key_suffix}；当前库已备份为 {backup_path.name}。以后更新会自动继承这些数据。"
-            )
-        except (OSError, sqlite3.Error, KeyStorageError, ValueError) as exc:
-            self.store = AccountStore(self.database_path)
-            messagebox.showerror(APP_NAME, f"迁移旧版数据失败：{exc}", parent=self.root)
-
-    def add_account(self) -> None:
-        dialog = AccountDialog(self.root, "添加账号")
-        self.root.wait_window(dialog.window)
-        if dialog.result:
-            try:
-                self.store.upsert_account(*dialog.result)
-            except sqlite3.IntegrityError:
-                messagebox.showerror(APP_NAME, "SteamID64 已存在。请使用编辑功能修改该记录。", parent=self.root)
-                return
-            self.refresh_table()
-            self.status_var.set("已保存账号记录。")
 
     def edit_selected(self) -> None:
         selected = self._selected_ids()
@@ -3751,54 +3698,6 @@ class SteamBanApp:
         self.import_cancel_event.set()
         self.cancel_import_button.configure(state="disabled")
         self.status_var.set("正在停止导入；已经提交的批次会保留，尚未读取的记录不会导入。")
-
-    def export_results(self) -> None:
-        path = filedialog.asksaveasfilename(
-            parent=self.root,
-            title="导出查询结果",
-            defaultextension=".csv",
-            initialfile=f"steam_ban_results_{datetime.now():%Y%m%d_%H%M%S}.csv",
-            filetypes=[("CSV 文件", "*.csv")],
-        )
-        if not path:
-            return
-        fields = [
-            "账号标签",
-            "SteamID64",
-            "备注",
-            "状态",
-            "VAC封禁",
-            "VAC次数",
-            "距最近封禁天数",
-            "游戏封禁次数",
-            "社区封禁",
-            "库存封禁",
-            "PUBG判断",
-            "查询时间",
-            "错误说明",
-        ]
-        with open(path, "w", encoding="utf-8-sig", newline="") as file:
-            writer = csv.writer(file)
-            writer.writerow(fields)
-            for row in self.store.export_rows():
-                writer.writerow(
-                    [
-                        row["account_name"],
-                        row["steam_id"],
-                        row["note"],
-                        row["status"],
-                        bool_label(row["vac_banned"]),
-                        row["vac_count"],
-                        row["days_since_last_ban"],
-                        row["game_bans"],
-                        bool_label(row["community_banned"]),
-                        row["economy_ban"],
-                        row["pubg_assessment"],
-                        row["checked_at"],
-                        row["query_error"],
-                    ]
-                )
-        self.status_var.set(f"结果已导出：{path}")
 
     def export_accounts(self) -> None:
         """导出账号（含密码）：勾选/选中优先；筛选状态下可明确只导出当前结果。"""
@@ -4026,7 +3925,7 @@ class SteamBanApp:
                     self.legacy_scan_running = False
                     self._should_scan_legacy_profile = False
                     if not (self.query_running or self.import_running or self.login_running or self.update_url):
-                        self.status_var.set(f"自动查找旧版账号数据失败：{payload}；可点击“迁移旧版数据”选择账号库。")
+                        self.status_var.set(f"自动查找旧版账号数据失败：{payload}。")
                 elif kind == "update_available":
                     version, url = payload
                     self.update_check_running = False
@@ -4162,7 +4061,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v4.1.0") == (4, 1, 0)
+    assert version_key("v4.1.1") == (4, 1, 1)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
