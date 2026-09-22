@@ -32,6 +32,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
+APP_VERSION = "3.0.0"
 
 API_URLS = (
     "https://api.steampowered.com/ISteamUser/GetPlayerBans/v1/",
@@ -370,9 +371,13 @@ def txt_record(line: str, separator: str | None = None) -> tuple | None:
                 continue
             if len(parts) == 2:
                 return account, placeholder_for(account), '', parts[1]
-            if len(parts) == 3 and STEAM_ID_PATTERN.fullmatch(parts[2]):
-                return account, parts[2], '', parts[1]
-            return account, placeholder_for(account), parts[2], parts[1]
+            # 导出格式是「账号----密码----SteamID64」。密码本身也可能包含分隔符，
+            # 因而应从右侧识别 ID，并把中间全部还原为密码。
+            if STEAM_ID_PATTERN.fullmatch(parts[-1]):
+                return account, parts[-1], '', sep.join(parts[1:-1])
+            # 没有末尾 SteamID64 时仍兼容手工写的「账号----密码----备注」；
+            # 多出的分段属于备注，不能像旧实现一样直接丢弃。
+            return account, placeholder_for(account), sep.join(parts[2:]), parts[1]
     return None
 
 
@@ -507,11 +512,17 @@ def import_record(row: list[str], layout: CsvLayout) -> tuple[str, str, str, str
         password = cell(layout.password_index)
     else:
         first = cell(0)
-        first_is_steam_id = bool(STEAM_ID_PATTERN.fullmatch(first))
-        steam_id = first if first_is_steam_id else cell(1)
-        account_name = '' if first_is_steam_id else first
-        note = cell(1) if first_is_steam_id else cell(2)
-        password = ''
+        second = cell(1)
+        third = cell(2)
+        if STEAM_ID_PATTERN.fullmatch(first):
+            # 无账号名时，按 SteamID64,备注 处理。
+            steam_id, account_name, note, password = first, '', second, ''
+        elif STEAM_ID_PATTERN.fullmatch(second):
+            # 常见的无表头格式：账号,SteamID64,备注。
+            steam_id, account_name, note, password = second, first, third, ''
+        else:
+            # 另一个常见格式：账号,密码,备注。第二列不是 17 位 ID 时绝不能丢掉它。
+            steam_id, account_name, note, password = '', first, third, second
     if not STEAM_ID_PATTERN.fullmatch(steam_id):
         # 没有 64 位 ID：先用账号名占位，点「开始查询」时会自动去 Steam 解析真实 ID
         if not account_name:
@@ -700,38 +711,41 @@ class AccountStore:
     @staticmethod
     def _store_records(connection, stats: dict, records: list) -> None:
         """把一批记录加密后写库（records 为 (账号, ID/占位, 备注, 密码)）。"""
-        for account_name, steam_id, note, password in records:
-            account_name = (account_name or '').strip()
-            steam_id = (steam_id or '').strip()
-            if not account_name and not steam_id:
-                continue
-            if not steam_id:                      # 兜底：绝不允许写入空 ID（会和 UNIQUE 冲突挤成一条）
-                steam_id = placeholder_for(account_name)
-            if password:
-                stats['passwords_saved'] += 1
-            password_enc = AccountStore._encrypt_password(password)
-            real_id = bool(STEAM_ID_PATTERN.fullmatch(steam_id))
-            existing = None
-            if account_name:
-                existing = connection.execute(
-                    'SELECT id, steam_id FROM accounts WHERE account_name = ? COLLATE NOCASE', (account_name,)
-                ).fetchone()
-            if existing is not None and (not real_id or not STEAM_ID_PATTERN.fullmatch(existing['steam_id'] or '')):
-                # 同名账号只保留一行：占位行这次拿到真实 ID 就地升级，不会再多插一条
-                target = steam_id if real_id else existing['steam_id']
-                taken = connection.execute('SELECT id FROM accounts WHERE steam_id=?', (target,)).fetchone()
-                if taken is None or int(taken['id']) == int(existing['id']):
-                    with connection:
+        if not records:
+            return
+        # CSV / JSON / TXT 共用同一合并逻辑。整个批次在一个事务内完成，既保留
+        # 大文件导入的提交效率，也避免 CSV 绕过“同账号占位行升级”而分裂成两条记录。
+        with connection:
+            for account_name, steam_id, note, password in records:
+                account_name = (account_name or '').strip()
+                steam_id = (steam_id or '').strip()
+                if not account_name and not steam_id:
+                    continue
+                if not steam_id:                  # 兜底：绝不允许写入空 ID（会和 UNIQUE 冲突挤成一条）
+                    steam_id = placeholder_for(account_name)
+                if password:
+                    stats['passwords_saved'] += 1
+                password_enc = AccountStore._encrypt_password(password)
+                real_id = bool(STEAM_ID_PATTERN.fullmatch(steam_id))
+                existing = None
+                if account_name:
+                    existing = connection.execute(
+                        'SELECT id, steam_id FROM accounts WHERE account_name = ? COLLATE NOCASE', (account_name,)
+                    ).fetchone()
+                if existing is not None and (not real_id or not STEAM_ID_PATTERN.fullmatch(existing['steam_id'] or '')):
+                    # 同名账号只保留一行：占位行这次拿到真实 ID 就地升级，不会再多插一条。
+                    target = steam_id if real_id else existing['steam_id']
+                    taken = connection.execute('SELECT id FROM accounts WHERE steam_id=?', (target,)).fetchone()
+                    if taken is None or int(taken['id']) == int(existing['id']):
                         connection.execute(
                             'UPDATE accounts SET steam_id=?, note=?,'
                             " password_enc=COALESCE(NULLIF(?, ''), password_enc) WHERE id=?",
                             (target, note, password_enc, int(existing['id'])),
                         )
-                    stats['imported'] += 1
-                    continue
-            with connection:
+                        stats['imported'] += 1
+                        continue
                 connection.execute(AccountStore.UPSERT_SQL, (account_name, steam_id, note, password_enc))
-            stats['imported'] += 1
+                stats['imported'] += 1
 
     @staticmethod
     def _import_json(
@@ -754,8 +768,10 @@ class AccountStore:
                 raise ValueError('无法读取文件编码。请使用 UTF-8 或 GB18030 编码的 JSON。')
             stats = AccountStore._import_stats(source_path, encoding)
             data = json.loads(text)
+            items = list(json_records(data))
+            total_items = len(items)
             records = []
-            for item in json_records(data):
+            for index, item in enumerate(items, start=1):
                 if cancel_event.is_set():
                     stats['canceled'] = True
                     break
@@ -772,7 +788,11 @@ class AccountStore:
                 if len(records) >= IMPORT_DB_BATCH_SIZE:
                     AccountStore._store_records(connection, stats, records)
                     records = []
-                    stats['percent'] = min(99, int(stats['read'] * 100 / max(1, stats['read'] + 1)))
+                    stats['percent'] = min(99, int(index * 100 / max(1, total_items)))
+                    progress(dict(stats))
+                elif index % 50 == 0:
+                    # JSON 已整体读入内存，按已处理记录数报告真实解析进度，不能用 read/(read+1) 伪造百分比。
+                    stats['percent'] = min(99, int(index * 100 / max(1, total_items)))
                     progress(dict(stats))
             AccountStore._store_records(connection, stats, records)
             stats['percent'] = 100 if not stats['canceled'] else stats['percent']
@@ -878,16 +898,12 @@ class AccountStore:
                         return
                     stats['read'] += 1
                     account_name, steam_id, note, password = record
-                    if password:
-                        stats['passwords_saved'] += 1
-                    pending.append((account_name, steam_id, note, AccountStore._encrypt_password(password)))
+                    pending.append((account_name, steam_id, note, password))
 
                 def commit_pending() -> None:
                     if not pending:
                         return
-                    with connection:
-                        connection.executemany(AccountStore.UPSERT_SQL, pending)
-                    stats['imported'] += len(pending)
+                    AccountStore._store_records(connection, stats, pending)
                     pending.clear()
                     report_progress(source)
 
@@ -1012,11 +1028,16 @@ class AccountStore:
     def save_result(self, account_id: int, player: dict[str, Any] | None, error: str = '') -> None:
         self.save_results_batch([(account_id, player, error)])
 
-    def export_account_rows(self, account_ids: Iterable[int] | None = None) -> Iterator[tuple]:
-        """导出账号（账号名、SteamID64、备注、解密后的密码）；account_ids 为 None 时导出全部。"""
+    def export_account_rows(self, account_ids: Iterable[int] | None = None, mode: str = 'all') -> Iterator[tuple]:
+        """导出账号（账号名、SteamID64、备注、解密后的密码）。
+
+        指定 account_ids 时按所选账号导出；未指定时可按 risk/safe 筛选导出，默认导出全部。
+        """
         columns = 'SELECT account_name, steam_id, note, password_enc FROM accounts'
         if account_ids is None:
-            cursor = self.connection.execute(columns + ' ORDER BY account_name COLLATE NOCASE, steam_id')
+            cursor = self.connection.execute(
+                f'{columns} {self._mode_where(mode)} ORDER BY account_name COLLATE NOCASE, steam_id'
+            )
         else:
             ids = [int(item) for item in account_ids]
             if not ids:
@@ -1796,13 +1817,14 @@ class PasteImportDialog:
 
 
 class ExportFormatDialog:
-    """导出账号前先问一下要什么格式。"""
+    """导出账号前选择格式；筛选状态下可明确选择是否只导出当前筛选结果。"""
 
-    def __init__(self, parent: Any):
+    def __init__(self, parent: Any, filter_mode: str = 'all', filter_count: int = 0):
         self.window = Toplevel(parent)
         self.window.title("导出账号")
         self.window.transient(parent)
         self.result = None
+        self.filtered_only_var = BooleanVar(value=filter_mode != 'all')
         frame = ttk.Frame(self.window, padding=18)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="选择导出格式", style="SectionTitle.TLabel").pack(anchor="w")
@@ -1811,6 +1833,14 @@ class ExportFormatDialog:
             text="文件里是明文密码，请只保存在自己机器上。",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(4, 10))
+        if filter_mode != 'all':
+            mode_label = {'risk': '有风险/异常', 'safe': '无风险'}.get(filter_mode, '当前')
+            ttk.Checkbutton(
+                frame,
+                text=f"仅导出当前筛选结果（{mode_label}，{filter_count} 个账号）",
+                variable=self.filtered_only_var,
+                bootstyle="primary",
+            ).pack(anchor="w", pady=(0, 8))
         for kind, label in (
             ("csv", "CSV —— account,password,steam_id,note（可直接再导入）"),
             ("txt", "TXT —— 账号----密码----SteamID64"),
@@ -1825,7 +1855,7 @@ class ExportFormatDialog:
         self.window.grab_set()
 
     def _choose(self, kind: str) -> None:
-        self.result = kind
+        self.result = (kind, bool(self.filtered_only_var.get()))
         self.window.destroy()
 
 
@@ -1874,6 +1904,7 @@ class SteamBanApp:
         )
         self.count_var = StringVar(value="0 个账号")
         self.list_hint_var = StringVar(value="正在准备账号清单…")
+        self.query_progress_var = StringVar(value="")
         self.show_only_risk_var = BooleanVar(value=False)
         self.show_only_safe_var = BooleanVar(value=False)
         self.checked_ids = set()
@@ -1881,6 +1912,9 @@ class SteamBanApp:
         self.events = queue.Queue()
         self.query_running = False
         self.import_running = False
+        self.login_running = False
+        self.query_completed = 0
+        self.query_total = 0
         self.import_cancel_event = None
         self.loaded_rows = 0
         self.table_total = 0
@@ -1952,7 +1986,7 @@ class SteamBanApp:
             text="批量读取 Steam 公开封禁状态。账户资料与结果仅保存在本机。",
             style="HeaderSubtitle.TLabel",
         ).pack(anchor="w", pady=(4, 0))
-        ttk.Label(header, text="Windows 桌面版", style="Badge.TLabel").pack(side="right", anchor="n", pady=(6, 0))
+        ttk.Label(header, text=f"Windows 桌面版 · v{APP_VERSION}", style="Badge.TLabel").pack(side="right", anchor="n", pady=(6, 0))
 
         key_card = ttk.Frame(outer, style="Card.TFrame", padding=UiMetrics.CARD_PADDING)
         key_card.pack(fill="x", pady=(0, UiMetrics.SECTION_GAP))
@@ -2045,8 +2079,24 @@ class SteamBanApp:
         self.query_all_button = ttk.Button(query_actions, text="查询全部", command=lambda: self.start_query(True), bootstyle="success")
         self.query_all_button.pack(side="left", padx=(8, 0))
 
+        self.query_progress_card = ttk.Frame(outer, style="Card.TFrame", padding=(UiMetrics.CARD_PADDING, 12))
+        query_progress_header = ttk.Frame(self.query_progress_card, style="Card.TFrame")
+        query_progress_header.pack(fill="x", pady=(0, 8))
+        ttk.Label(query_progress_header, text="查询进度", style="SectionTitle.TLabel").pack(side="left")
+        ttk.Label(query_progress_header, textvariable=self.query_progress_var, style="Hint.TLabel").pack(side="right")
+        self.query_progress_bar = ttk.Progressbar(
+            self.query_progress_card,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            value=0,
+            bootstyle="success",
+        )
+        self.query_progress_bar.pack(fill="x")
+
         table_card = ttk.Frame(outer, style="Card.TFrame", padding=UiMetrics.CARD_PADDING)
         table_card.pack(fill="both", expand=True)
+        self.table_card = table_card
         table_header = ttk.Frame(table_card, style="Card.TFrame")
         table_header.pack(fill="x", pady=(0, 10))
         ttk.Label(table_header, text="账号清单", style="SectionTitle.TLabel").pack(side="left")
@@ -2152,6 +2202,11 @@ class SteamBanApp:
 
     def open_steam_login(self, account_id: int | None = None) -> None:
         """用本机保存的账号密码自动登录指定账号；不传就登录列表里选中的那个。"""
+        if self.login_running:
+            self.status_var.set("已有 Steam 登录正在进行，请等待当前登录完成。")
+            return
+        if self.query_running or self.import_running:
+            return
         if account_id is None:
             selected = self._selected_ids()
             if len(selected) != 1:
@@ -2182,13 +2237,20 @@ class SteamBanApp:
             webbrowser.open("https://steamcommunity.com/login/home/")
             self.status_var.set("未找到本机 Steam 客户端，已打开 Steam 官方登录页。")
             return
+        self.login_running = True
         self._set_controls(False)
         self.status_var.set(f"正在退出当前 Steam 并登录账号 {account_name}，请稍候…")
-        threading.Thread(
-            target=self._steam_login_worker,
-            args=(steam_exe, account_name, account.steam_id, password),
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=self._steam_login_worker,
+                args=(steam_exe, account_name, account.steam_id, password),
+                daemon=True,
+            ).start()
+        except RuntimeError as exc:
+            self.login_running = False
+            self._set_controls(True)
+            self.status_var.set("无法启动自动登录。")
+            messagebox.showerror(APP_NAME, f"无法启动自动登录线程：{exc}", parent=self.root)
 
     def _steam_login_worker(self, steam_exe: str, account_name: str, steam_id: str, password: str) -> None:
         """后台线程：结束当前 Steam，写入自动登录配置，再带账号密码启动客户端。"""
@@ -2310,6 +2372,22 @@ class SteamBanApp:
         ):
             widget.configure(state=state)
 
+    def _set_query_progress(self, completed: int, total: int, phase: str = "查询进度") -> None:
+        """显示查询的确定性进度；解析 SteamID64 阶段也保留同一条进度条。"""
+        total = max(0, int(total))
+        completed = max(0, min(int(completed), total)) if total else 0
+        percent = int(completed * 100 / total) if total else 0
+        self.query_completed = completed
+        self.query_total = total
+        self.query_progress_bar.configure(value=percent)
+        self.query_progress_var.set(f"{phase}：{completed} / {total}（{percent}%）")
+        if not self.query_progress_card.winfo_ismapped():
+            self.query_progress_card.pack(
+                fill="x",
+                pady=(0, UiMetrics.SECTION_GAP),
+                before=self.table_card,
+            )
+
     def _scroll_tree(self, *args: str) -> None:
         self.tree.yview(*args)
         self.root.after_idle(self._load_more_if_needed)
@@ -2354,6 +2432,12 @@ class SteamBanApp:
             self.show_only_safe_var.set(False)
         elif which == 'safe' and self.show_only_safe_var.get():
             self.show_only_risk_var.set(False)
+        # 只在进入筛选模式时清空：防止隐藏记录误操作，同时允许关闭筛选后保留当前勾选。
+        if self._filter_mode() != 'all':
+            self.checked_ids.clear()
+            selected = self.tree.selection()
+            if selected:
+                self.tree.selection_remove(selected)
         self.refresh_table()
 
     def _filter_mode(self) -> str:
@@ -2574,12 +2658,14 @@ class SteamBanApp:
         self.status_var.set(f"结果已导出：{path}")
 
     def export_accounts(self) -> None:
-        """导出账号（含密码）：先选格式，再选保存位置；勾选/选中的账号优先，没勾选就导出全部。"""
-        format_dialog = ExportFormatDialog(self.root)
+        """导出账号（含密码）：勾选/选中优先；筛选状态下可明确只导出当前结果。"""
+        filter_mode = self._filter_mode()
+        filter_count = self.store.count_accounts(filter_mode) if filter_mode != 'all' else 0
+        format_dialog = ExportFormatDialog(self.root, filter_mode, filter_count)
         self.root.wait_window(format_dialog.window)
         if not format_dialog.result:
             return
-        kind = format_dialog.result
+        kind, filtered_only = format_dialog.result
         suffix = {'csv': '.csv', 'txt': '.txt', 'json': '.json'}[kind]
         filters = {
             'csv': [('CSV 文件', '*.csv')],
@@ -2587,7 +2673,14 @@ class SteamBanApp:
             'json': [('JSON 文件', '*.json')],
         }[kind]
         ids = self._selected_ids()
-        scope = f"勾选/选中的 {len(ids)} 个账号" if ids else "全部账号"
+        export_mode = 'all'
+        if ids:
+            scope = f"勾选/选中的 {len(ids)} 个账号"
+        elif filtered_only and filter_mode != 'all':
+            scope = f"当前筛选的 {filter_count} 个账号"
+            export_mode = filter_mode
+        else:
+            scope = "全部账号"
         path = filedialog.asksaveasfilename(
             parent=self.root,
             title=f"导出账号（{scope} · {kind.upper()}）",
@@ -2605,14 +2698,14 @@ class SteamBanApp:
             return
         target = Path(path)
         try:
-            count = write_account_export(target, self.store.export_account_rows(ids or None))
+            count = write_account_export(target, self.store.export_account_rows(ids or None, export_mode))
         except OSError as exc:
             messagebox.showerror(APP_NAME, f"导出失败：{exc}", parent=self.root)
             return
-        self.status_var.set(f"已导出 {count} 个账号到 {target}（含明文密码，注意保管）。")
+        self.status_var.set(f"已导出 {count} 个账号（{scope}）到 {target}（含明文密码，注意保管）。")
 
     def start_query(self, query_all: bool) -> None:
-        if self.query_running or self.import_running:
+        if self.query_running or self.import_running or self.login_running:
             return
         api_key = self.api_key_var.get().strip()
         if not api_key:
@@ -2632,6 +2725,7 @@ class SteamBanApp:
             return
         self.query_running = True
         self._set_controls(False)
+        self._set_query_progress(0, total, "准备查询")
         self.status_var.set(f"正在查询 0 / {total} 条记录…")
         threading.Thread(
             target=self._query_worker,
@@ -2639,7 +2733,14 @@ class SteamBanApp:
             daemon=True,
         ).start()
 
-    def _resolve_batch_ids(self, batch: list, failures: int, store: AccountStore):
+    def _resolve_batch_ids(
+        self,
+        batch: list,
+        failures: int,
+        store: AccountStore,
+        completed_before_batch: int,
+        total: int,
+    ):
         """把这一批里缺 SteamID64 的账号解析出来（账号密码 -> SteamID64）。
 
         store 必须是查询工作线程独享的连接，避免跨线程复用 UI 线程的 SQLite 连接。
@@ -2656,13 +2757,14 @@ class SteamBanApp:
             password = store.account_password(account.account_id)
             if not password:
                 store.save_result(account.account_id, None, "缺少密码，无法解析 SteamID64（请编辑该账号填入密码后重试）")
+                self.events.put(("resolve_progress", (name, completed_before_batch + handled, total)))
                 continue
-            self.events.put(("resolve_progress", name))
             try:
                 real_id = steam_login.resolve_steam_id(name, password)
             except steam_login.SteamAuthError as exc:
                 failures += 1
                 store.save_result(account.account_id, None, f"无法解析 SteamID64：{exc}")
+                self.events.put(("resolve_progress", (name, completed_before_batch + handled, total)))
                 if failures >= 5:
                     return (
                         resolved,
@@ -2674,11 +2776,14 @@ class SteamBanApp:
             except Exception as exc:
                 failures += 1
                 store.save_result(account.account_id, None, f"无法解析 SteamID64：{exc!r}")
+                self.events.put(("resolve_progress", (name, completed_before_batch + handled, total)))
                 continue
             failures = 0
             if store.update_steam_id(account.account_id, real_id):
                 resolved.append(Account(account.account_id, account.account_name, real_id, account.note))
             time.sleep(1.0)          # 放慢节奏，降低被 Steam 限流的概率
+            # SteamID64 的解析按账号串行。每处理一条都汇报，避免大批次解析时进度条停在 0%。
+            self.events.put(("resolve_progress", (name, completed_before_batch + handled, total)))
         return resolved, failures, None, handled
 
     def _query_worker(self, api_key: str, account_ids: list[int] | None, total: int, db_path: Path) -> None:
@@ -2692,7 +2797,7 @@ class SteamBanApp:
         try:
             for original_batch in AccountStore.account_batches(db_path, account_ids):
                 batch, resolve_failures, stop_message, handled = self._resolve_batch_ids(
-                    original_batch, resolve_failures, store
+                    original_batch, resolve_failures, store, completed, total
                 )
                 if stop_message:
                     # 已解析成功但尚未查询的条目不能被算作“完成”。
@@ -2739,18 +2844,25 @@ class SteamBanApp:
                     self.store.save_results_batch(payload)
                 elif kind == "query_progress":
                     completed, total = payload
+                    self._set_query_progress(completed, total)
                     self.status_var.set(f"正在查询 {completed} / {total} 条记录…")
                 elif kind == "resolve_progress":
-                    self.status_var.set(f"正在解析 SteamID64：{payload}…（需要账号+密码，每个约 1 秒）")
+                    account_name, processed, total = payload
+                    self._set_query_progress(processed, total, "正在解析 SteamID64")
+                    self.status_var.set(
+                        f"正在解析 SteamID64：{account_name}…（已处理 {processed} / {total}，每个约 1 秒）"
+                    )
                 elif kind == "query_done":
                     self.query_running = False
-                    self._set_controls(not self.import_running)
+                    self._set_query_progress(payload, payload, "查询完成")
+                    self._set_controls(not (self.import_running or self.login_running))
                     self.status_var.set(f"查询完成：共处理 {payload} 条记录。")
                     changed = True
                 elif kind == "query_blocked":
                     completed, total, message = payload
                     self.query_running = False
-                    self._set_controls(not self.import_running)
+                    self._set_query_progress(completed, total, "查询已停止")
+                    self._set_controls(not (self.import_running or self.login_running))
                     self.status_var.set(f"查询已停止：已完成 {completed} / {total} 条；没有把未查询账号标记为失败。")
                     messagebox.showerror(APP_NAME, message, parent=self.root)
                     # SteamID 解析失败会由工作线程直接写入独立连接；即使没有 API 成功结果也要刷新列表。
@@ -2765,7 +2877,7 @@ class SteamBanApp:
                     self.import_running = False
                     self.import_cancel_event = None
                     self.cancel_import_button.configure(state="disabled")
-                    self._set_controls(not self.query_running)
+                    self._set_controls(not (self.query_running or self.login_running))
                     extra = f"；已加密保存密码 {payload['passwords_saved']} 条" if payload["passwords_saved"] else ""
                     if payload["canceled"]:
                         self.status_var.set(
@@ -2782,13 +2894,15 @@ class SteamBanApp:
                     self.import_running = False
                     self.import_cancel_event = None
                     self.cancel_import_button.configure(state="disabled")
-                    self._set_controls(not self.query_running)
+                    self._set_controls(not (self.query_running or self.login_running))
                     self.status_var.set("导入失败。")
                     messagebox.showerror(APP_NAME, f"无法导入文件：{payload}", parent=self.root)
                 elif kind == "steam_login_done":
+                    self.login_running = False
                     self._set_controls(not (self.query_running or self.import_running))
                     self.status_var.set(payload)
                 elif kind == "steam_login_failed":
+                    self.login_running = False
                     self._set_controls(not (self.query_running or self.import_running))
                     self.status_var.set("自动登录未完成。")
                     messagebox.showerror(APP_NAME, f"自动登录失败：{payload}", parent=self.root)
@@ -2855,6 +2969,8 @@ def run_self_test() -> None:
         })
         assert economy_store.count_accounts("risk") == 1
         assert economy_store.count_accounts("safe") == 0
+        assert [row[0] for row in economy_store.export_account_rows(None, "risk")] == ["库存限制"]
+        assert list(economy_store.export_account_rows(None, "safe")) == []
         economy_store.close()
 
         fixture = root / "large_fixture.csv"
@@ -2908,6 +3024,45 @@ def run_self_test() -> None:
         }
         headerless_store.close()
 
+        # 无表头的「账号,密码,备注」不能把密码误判为 SteamID64 后丢弃。
+        headerless_credentials_csv = root / "headerless_credentials.csv"
+        headerless_credentials_csv.write_text(
+            "credential-user,credential-pass,首行备注\ncredential-user-two,second-pass,第二行备注\n",
+            encoding="utf-8",
+        )
+        headerless_credentials_stats = AccountStore.import_file(
+            root / "headerless_credentials.sqlite3", headerless_credentials_csv, threading.Event(), lambda _update: None
+        )
+        assert headerless_credentials_stats["imported"] == 2, headerless_credentials_stats
+        headerless_credentials_store = AccountStore(root / "headerless_credentials.sqlite3")
+        credential_rows = {
+            row["account_name"]: row for row in headerless_credentials_store.list_accounts_page(0, 10)[0]
+        }
+        assert credential_rows["credential-user"]["steam_id"] == "credential-user"
+        assert credential_rows["credential-user"]["note"] == "首行备注"
+        assert headerless_credentials_store.account_password(int(credential_rows["credential-user"]["id"])) == "credential-pass"
+        headerless_credentials_store.close()
+
+        # CSV 与 TXT/JSON 共用占位账号合并规则：同账号补入真实 ID 后仍只有一行，并保留已存密码。
+        merge_txt = root / "same_account.txt"
+        merge_txt.write_text("same-user----saved-pass\n", encoding="utf-8")
+        merge_db = root / "same_account.sqlite3"
+        AccountStore.import_file(merge_db, merge_txt, threading.Event(), lambda _update: None)
+        merge_csv = root / "same_account.csv"
+        merge_csv.write_text(
+            "account,steam_id,note\nsame-user,76561198000000031,来自 CSV\n",
+            encoding="utf-8",
+        )
+        merge_stats = AccountStore.import_file(merge_db, merge_csv, threading.Event(), lambda _update: None)
+        assert merge_stats["imported"] == 1, merge_stats
+        merge_store = AccountStore(merge_db)
+        merge_rows = merge_store.list_accounts_page(0, 10)[0]
+        assert len(merge_rows) == 1, merge_rows
+        assert merge_rows[0]["steam_id"] == "76561198000000031"
+        assert merge_rows[0]["note"] == "来自 CSV"
+        assert merge_store.account_password(int(merge_rows[0]["id"])) == "saved-pass"
+        merge_store.close()
+
         # TXT：账号----密码（没有 SteamID64，先用账号名占位）
         txt_fixture = root / "accounts.txt"
         txt_fixture.write_text(
@@ -2923,6 +3078,10 @@ def run_self_test() -> None:
         assert txt_rows["user-one"]["steam_id"] == "user-one"          # 占位，等查询时解析
         assert txt_store.account_password(int(txt_rows["user-two"]["id"])) == "pass-two"
         assert txt_rows["user-two"]["note"] == "备注二"
+        # 导出格式的密码本身含有分隔符时，须从行尾识别 SteamID64 后完整还原密码。
+        assert txt_record("delimiter-user----pass----with----separator----76561198000000032") == (
+            "delimiter-user", "76561198000000032", "", "pass----with----separator"
+        )
         # 解析出真实 ID 后写回
         assert txt_store.update_steam_id(int(txt_rows["user-one"]["id"]), "76561190000000001") is True
         assert txt_store.connection.execute(
@@ -2944,6 +3103,25 @@ def run_self_test() -> None:
         assert json_rows["json-b"]["steam_id"] == "json-b"
         assert json_store.account_password(int(json_rows["json-b"]["id"])) == "pw-b"
         json_store.close()
+
+        # JSON 进度按实际已处理记录数递增，不能停在一个伪造的 99%。
+        json_progress_fixture = root / "json_progress.json"
+        json_progress_fixture.write_text(json.dumps([
+            {"account": f"progress-{index}", "steam_id": str(76561198000001000 + index)}
+            for index in range(120)
+        ]), encoding="utf-8")
+        json_progress_updates = []
+        json_progress_stats = AccountStore.import_file(
+            root / "json_progress.sqlite3",
+            json_progress_fixture,
+            threading.Event(),
+            lambda update: json_progress_updates.append(dict(update)),
+        )
+        json_percentages = [update["percent"] for update in json_progress_updates]
+        assert json_progress_stats["imported"] == 120, json_progress_stats
+        assert any(0 < percent < 100 for percent in json_percentages), json_percentages
+        assert json_percentages == sorted(json_percentages), json_percentages
+        assert json_percentages[-1] == 100, json_percentages
 
         # 导出账号 → 再导入，数据应当对得上（导出含明文密码）
         export_store = AccountStore(root / "txt.sqlite3")
@@ -3027,6 +3205,108 @@ def run_self_test() -> None:
         query_row = query_store.list_accounts_page(0, 1)[0][0]
         assert query_row["steam_id"] == "76561198000000004"
         query_store.close()
+        assert ("resolve_progress", ("query-user", 1, 1)) in query_events, query_events
+        assert ("query_progress", (1, 1)) in query_events, query_events
+
+        # 筛选会清空勾选和行选中，删除/导出不应影响被隐藏的记录。
+        class FakeVar:
+            def __init__(self, value=None):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class FakeTree:
+            def __init__(self, selected):
+                self.selected = tuple(selected)
+                self.removed = ()
+
+            def selection(self):
+                return self.selected
+
+            def selection_remove(self, selected):
+                self.removed = tuple(selected)
+                self.selected = ()
+
+        filter_app = SteamBanApp.__new__(SteamBanApp)
+        filter_app.show_only_risk_var = FakeVar(True)
+        filter_app.show_only_safe_var = FakeVar(True)
+        filter_app.checked_ids = {3, 4}
+        filter_app.tree = FakeTree(("3", "4"))
+        filter_refreshes = []
+        filter_app.refresh_table = lambda: filter_refreshes.append(True)
+        filter_app._toggle_filter("risk")
+        assert filter_app.show_only_safe_var.get() is False
+        assert not filter_app.checked_ids
+        assert filter_app.tree.removed == ("3", "4")
+        assert filter_refreshes == [True]
+
+        # 关闭筛选只刷新列表，不应把当前可见的勾选和行选中再清空一次。
+        filter_app.show_only_risk_var.set(False)
+        filter_app.checked_ids = {9}
+        filter_app.tree = FakeTree(("9",))
+        filter_app._toggle_filter("risk")
+        assert filter_app.checked_ids == {9}
+        assert filter_app.tree.removed == ()
+        assert filter_refreshes == [True, True]
+
+        # 筛选状态下导出格式对话框会把“仅当前筛选结果”一并作为明确选择返回。
+        class FakeDialogWindow:
+            def __init__(self):
+                self.destroyed = False
+
+            def destroy(self):
+                self.destroyed = True
+
+        export_dialog = ExportFormatDialog.__new__(ExportFormatDialog)
+        export_dialog.filtered_only_var = FakeVar(True)
+        export_dialog.window = FakeDialogWindow()
+        export_dialog._choose("csv")
+        assert export_dialog.result == ("csv", True)
+        assert export_dialog.window.destroyed is True
+
+        # 实时查询进度以完成数量计算、显示百分比并在第一次更新时呈现进度卡片。
+        class FakeProgress:
+            def __init__(self):
+                self.value = None
+
+            def configure(self, **kwargs):
+                self.value = kwargs["value"]
+
+        class FakeCard:
+            def __init__(self):
+                self.mapped = False
+                self.pack_args = None
+
+            def winfo_ismapped(self):
+                return self.mapped
+
+            def pack(self, **kwargs):
+                self.mapped = True
+                self.pack_args = kwargs
+
+        progress_app = SteamBanApp.__new__(SteamBanApp)
+        progress_app.query_progress_bar = FakeProgress()
+        progress_app.query_progress_var = FakeVar()
+        progress_app.query_progress_card = FakeCard()
+        progress_app.table_card = object()
+        progress_app._set_query_progress(7, 12, "正在查询")
+        assert progress_app.query_completed == 7 and progress_app.query_total == 12
+        assert progress_app.query_progress_bar.value == 58
+        assert progress_app.query_progress_var.get() == "正在查询：7 / 12（58%）"
+        assert progress_app.query_progress_card.pack_args is not None
+
+        # 运行中的登录被拒绝，双击列表或重复点击都不能再启动第二个 Steam 线程。
+        login_guard_app = SteamBanApp.__new__(SteamBanApp)
+        login_guard_app.login_running = True
+        login_guard_app.query_running = False
+        login_guard_app.import_running = False
+        login_guard_app.status_var = FakeVar()
+        login_guard_app.open_steam_login()
+        assert login_guard_app.status_var.get() == "已有 Steam 登录正在进行，请等待当前登录完成。"
 
         # 没有 SteamID64 时，自动登录仅跳过配置写入，仍可走客户端登录与密码填充。
         login_app = SteamBanApp.__new__(SteamBanApp)
