@@ -2,7 +2,7 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 echo ============================================
-echo  Steam 封禁批量查询器 - 编译成 exe
+echo  PUBG自动登陆系统 - 编译成 exe
 echo ============================================
 echo.
 
@@ -23,7 +23,7 @@ if errorlevel 1 ( echo [错误] 依赖安装失败 & pause & exit /b 1 )
 
 echo.
 echo [2/3] 打包 ...
-%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name "Steam封禁批量查询器-自动登录版" steam_ban_manager.py
+%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name "PUBG自动登陆系统" steam_ban_manager.py
 if errorlevel 1 ( echo [错误] 打包失败 & pause & exit /b 1 )
 
 echo.
