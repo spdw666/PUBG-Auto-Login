@@ -471,6 +471,8 @@ GMEM_MOVEABLE = 0x0002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 STEAM_LOGIN_PROCESS_NAMES = frozenset({'steam.exe', 'steamwebhelper.exe'})
 LOGIN_WINDOW_TIMEOUT = 45.0
+LOGIN_FORM_READY_DELAY = 2.5
+LOGIN_SUBMIT_RESULT_WAIT = 15.0
 # ``import ctypes.wintypes`` 只会把模块挂在 ctypes 命名空间；下面的 Win32 调用使用
 # wintypes.DWORD / HANDLE 等短名称，因此必须显式绑定，不能依赖 ctypes 的属性访问。
 wintypes = ctypes.wintypes
@@ -659,39 +661,29 @@ def automate_steam_login(
         return f'{int(timeout)} 秒内没有等到 Steam 登录窗口（可能已经用记住的登录信息直接进去了）'
     user32.ShowWindow(hwnd, 9)
     user32.SetForegroundWindow(hwnd)
-    if _wait_or_cancel(cancel_event, 1.2):
+    # CEF 的窗口标题常会早于登录表单的可编辑控件出现。过早粘贴会落到浏览器容器或
+    # 账号框；多等一小段时间，让 Steam 根据 -login 预填账号并把焦点交给密码框。
+    if _wait_or_cancel(cancel_event, LOGIN_FORM_READY_DELAY):
         _raise_if_login_cancelled(cancel_event)
     if user32.GetForegroundWindow() != hwnd:
         return 'Steam 登录窗口没能切到前台，已跳过自动填密码'
     if not _set_clipboard(password):
         return '剪贴板不可用，已跳过自动填密码'
     try:
-        for attempt in range(3):
-            if _wait_or_cancel(cancel_event, 0.5):
-                _raise_if_login_cancelled(cancel_event)
-            if attempt == 1:
-                _press(0x09)                 # Tab：从账号框挪到密码框
-            elif attempt == 2:               # 最后一招：点窗口偏下一点的输入框位置
-                rect = ctypes.wintypes.RECT()
-                user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                x = int(rect.left + (rect.right - rect.left) * 0.5)
-                y = int(rect.top + (rect.bottom - rect.top) * 0.42)
-                user32.SetCursorPos(x, y)
-                if _wait_or_cancel(cancel_event, 0.2):
-                    _raise_if_login_cancelled(cancel_event)
-                user32.mouse_event(0x0002, 0, 0, 0, 0)
-                user32.mouse_event(0x0004, 0, 0, 0, 0)
+        # 只提交一次。旧逻辑会在同一 CEF 窗口内再 Tab/点击并粘贴两次；而第一次提交后
+        # 页面可能已经显示错误/验证界面或切换焦点，重复粘贴会把正确密码变成错误登录尝试。
+        _raise_if_login_cancelled(cancel_event)
+        _paste()
+        if _wait_or_cancel(cancel_event, 0.6):
             _raise_if_login_cancelled(cancel_event)
-            _paste()
-            if _wait_or_cancel(cancel_event, 0.6):
+        _press(0x0D)                         # Enter
+        attempts = max(1, int(LOGIN_SUBMIT_RESULT_WAIT))
+        for _ in range(attempts):
+            if _wait_or_cancel(cancel_event, 1.0):
                 _raise_if_login_cancelled(cancel_event)
-            _press(0x0D)                     # Enter
-            for _ in range(8):
-                if _wait_or_cancel(cancel_event, 1.0):
-                    _raise_if_login_cancelled(cancel_event)
-                if not user32.IsWindow(hwnd):
-                    return '已自动填入密码并提交'
-        return '已填入密码，但 Steam 还停在登录窗口（可能需要 Steam Guard 验证码）'
+            if not user32.IsWindow(hwnd):
+                return '已自动填入密码并提交'
+        return '已单次填入密码并提交；Steam 仍在登录窗口，请按提示完成 Steam Guard 或手动继续'
     finally:
         # 任一 Win32 调用异常、线程被上层捕获或登录窗口消失时都不能把密码留在剪贴板。
         _clear_clipboard()
