@@ -51,7 +51,7 @@ py -3.14 -m PyInstaller --noconfirm --clean --onefile --windowed --name "PUBG自
 py -3.14 steam_ban_manager.py --self-test
 ```
 
-覆盖：CSV/JSON/TXT 三种导入、密码 DPAPI 加解密回读、明文不入库、导出→再导入往返、封禁结果写入、分页、API Key 加解密。返回 0 即通过。
+覆盖：CSV/JSON/TXT 三种导入（含无表头 CSV、仅账号+密码 CSV）、密码 DPAPI 加解密回读、明文不入库、CSV/TXT/JSON 导出→再导入往返、封禁结果写入与库存封禁筛选、分页、API Key 加解密、未解析 SteamID64 的配置写入保护。返回 0 即通过。
 
 ## 需要你自己准备
 

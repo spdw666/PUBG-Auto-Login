@@ -478,12 +478,13 @@ def csv_layout(first_row: list[str]) -> CsvLayout:
     if not has_header:
         return CsvLayout(False, None, None, None, None)
     id_index = next((index for index, item in enumerate(header) if item in ID_HEADERS), None)
-    if id_index is None:
-        raise ValueError('检测到表头，但找不到 SteamID64 列。请将列名设为 steam_id、steamid64 或 64位ID。')
+    name_index = next((index for index, item in enumerate(header) if item in NAME_HEADERS), None)
+    if id_index is None and name_index is None:
+        raise ValueError('检测到表头，但既找不到 SteamID64 列，也找不到账号列。请将列名设为 steam_id、steamid64、64位ID 或 account。')
     return CsvLayout(
         True,
         id_index,
-        next((index for index, item in enumerate(header) if item in NAME_HEADERS), None),
+        name_index,
         next((index for index, item in enumerate(header) if item in NOTE_HEADERS), None),
         next((index for index, item in enumerate(header) if item in STEAM_PASSWORD_HEADERS), None),
     )
@@ -596,6 +597,7 @@ class AccountStore:
             (COALESCE(vac_banned, 0) > 0
              OR COALESCE(game_bans, 0) > 0
              OR COALESCE(community_banned, 0) > 0
+             OR lower(COALESCE(economy_ban, 'none')) NOT IN ('none', '')
              OR status = '查询失败')
         """
 
@@ -863,33 +865,45 @@ class AccountStore:
                     raise ValueError('导入文件为空。')
                 layout = csv_layout(first_row)
                 pending = []
-                for row in reader:
-                    if cancel_event.is_set():
-                        stats['canceled'] = True
-                        break
+
+                def queue_row(row: list[str]) -> None:
+                    """校验一行并加入待提交批次；无表头 CSV 的首行也必须经过这里。"""
                     try:
                         record = import_record(row, layout)
                     except ValueError:
                         stats['read'] += 1
                         stats['invalid'] += 1
-                        continue
+                        return
                     if record is None:
-                        continue
+                        return
                     stats['read'] += 1
                     account_name, steam_id, note, password = record
                     if password:
                         stats['passwords_saved'] += 1
                     pending.append((account_name, steam_id, note, AccountStore._encrypt_password(password)))
-                    if len(pending) >= IMPORT_DB_BATCH_SIZE:
-                        with connection:
-                            connection.executemany(AccountStore.UPSERT_SQL, pending)
-                        stats['imported'] += len(pending)
-                        pending.clear()
-                        report_progress(source)
-                if pending:
+
+                def commit_pending() -> None:
+                    if not pending:
+                        return
                     with connection:
                         connection.executemany(AccountStore.UPSERT_SQL, pending)
                     stats['imported'] += len(pending)
+                    pending.clear()
+                    report_progress(source)
+
+                # csv_layout 明确支持无表头格式；不能因为第一行用于检测就把它丢掉。
+                if not layout.has_header:
+                    queue_row(first_row)
+                    if len(pending) >= IMPORT_DB_BATCH_SIZE:
+                        commit_pending()
+                for row in reader:
+                    if cancel_event.is_set():
+                        stats['canceled'] = True
+                        break
+                    queue_row(row)
+                    if len(pending) >= IMPORT_DB_BATCH_SIZE:
+                        commit_pending()
+                commit_pending()
                 stats['percent'] = 100 if not stats['canceled'] else stats['percent']
                 progress(dict(stats))
                 return stats
@@ -1744,7 +1758,7 @@ def write_account_export(path: Path, rows: Iterable[tuple]) -> int:
         writer = csv.writer(file)
         writer.writerow(['account', 'password', 'steam_id', 'note'])
         for account_name, steam_id, note, password in rows:
-            writer.writerow([account_name, steam_id, note, password])
+            writer.writerow([account_name, password, steam_id, note])
             count += 1
     return count
 
@@ -2182,8 +2196,14 @@ class SteamBanApp:
             if not steam_login.shutdown_steam(steam_exe):
                 self.events.put(("steam_login_failed", "无法结束当前 Steam 进程，请手动退出 Steam 后重试。"))
                 return
-            steam_login.write_auto_login(steam_exe, steam_id, account_name)
-            tweaks = steam_login.apply_login_tweaks(steam_exe, steam_id)
+            tweaks = []
+            if STEAM_ID_PATTERN.fullmatch(steam_id):
+                steam_login.write_auto_login(steam_exe, steam_id, account_name)
+                tweaks = steam_login.apply_login_tweaks(steam_exe, steam_id)
+            else:
+                # 账号+密码导入时会先用账号名占位。不能把占位符写进 loginusers.vdf，
+                # 也不能传给依赖 32 位账号 ID 的 Steam 设置逻辑。
+                tweaks = ['尚未解析 SteamID64，已跳过 Steam 配置写入']
             steam_login.launch_login(steam_exe, account_name, password)
             login_result = steam_login.automate_steam_login(password)
         except (OSError, RuntimeError, KeyStorageError, ValueError) as exc:
@@ -2307,6 +2327,7 @@ class SteamBanApp:
             int(row["vac_banned"] or 0) > 0
             or int(row["game_bans"] or 0) > 0
             or int(row["community_banned"] or 0) > 0
+            or str(row["economy_ban"] or "none").lower() not in ("none", "")
             or row["status"] == "查询失败"
         )
         tag = "risk" if risk and row["status"] != "查询失败" else "failure" if row["status"] == "查询失败" else "success" if row["status"] == "查询成功" else ""
@@ -2612,75 +2633,100 @@ class SteamBanApp:
         self.query_running = True
         self._set_controls(False)
         self.status_var.set(f"正在查询 0 / {total} 条记录…")
-        threading.Thread(target=self._query_worker, args=(api_key, selected_ids, total), daemon=True).start()
+        threading.Thread(
+            target=self._query_worker,
+            args=(api_key, selected_ids, total, self.store.db_path),
+            daemon=True,
+        ).start()
 
-    def _resolve_batch_ids(self, batch: list, failures: int):
+    def _resolve_batch_ids(self, batch: list, failures: int, store: AccountStore):
         """把这一批里缺 SteamID64 的账号解析出来（账号密码 -> SteamID64）。
 
-        返回 (可继续查询的账号, 连续失败次数, 需要中止时的提示)。
+        store 必须是查询工作线程独享的连接，避免跨线程复用 UI 线程的 SQLite 连接。
+        返回 (可继续查询的账号, 连续失败次数, 需要中止时的提示, 已处理数量)。
         """
         resolved = []
+        handled = 0
         for account in batch:
+            handled += 1
             if STEAM_ID_PATTERN.fullmatch(account.steam_id):
                 resolved.append(account)
                 continue
             name = account.account_name or account.steam_id
-            password = self.store.account_password(account.account_id)
+            password = store.account_password(account.account_id)
             if not password:
-                self.store.save_result(account.account_id, None, "缺少密码，无法解析 SteamID64（请编辑该账号填入密码后重试）")
+                store.save_result(account.account_id, None, "缺少密码，无法解析 SteamID64（请编辑该账号填入密码后重试）")
                 continue
             self.events.put(("resolve_progress", name))
             try:
                 real_id = steam_login.resolve_steam_id(name, password)
             except steam_login.SteamAuthError as exc:
                 failures += 1
-                self.store.save_result(account.account_id, None, f"无法解析 SteamID64：{exc}")
+                store.save_result(account.account_id, None, f"无法解析 SteamID64：{exc}")
                 if failures >= 5:
-                    return resolved, failures, f"连续 {failures} 个账号解析 SteamID64 失败（最后一次：{exc}）。已停止，请检查账号密码或稍后再试。"
+                    return (
+                        resolved,
+                        failures,
+                        f"连续 {failures} 个账号解析 SteamID64 失败（最后一次：{exc}）。已停止，请检查账号密码或稍后再试。",
+                        handled,
+                    )
                 continue
             except Exception as exc:
                 failures += 1
-                self.store.save_result(account.account_id, None, f"无法解析 SteamID64：{exc!r}")
+                store.save_result(account.account_id, None, f"无法解析 SteamID64：{exc!r}")
                 continue
             failures = 0
-            if self.store.update_steam_id(account.account_id, real_id):
+            if store.update_steam_id(account.account_id, real_id):
                 resolved.append(Account(account.account_id, account.account_name, real_id, account.note))
             time.sleep(1.0)          # 放慢节奏，降低被 Steam 限流的概率
-        return resolved, failures, None
+        return resolved, failures, None, handled
 
-    def _query_worker(self, api_key: str, account_ids: list[int] | None, total: int) -> None:
+    def _query_worker(self, api_key: str, account_ids: list[int] | None, total: int, db_path: Path) -> None:
         completed = 0
         resolve_failures = 0
-        for batch in AccountStore.account_batches(self.store.db_path, account_ids):
-            batch, resolve_failures, stop_message = self._resolve_batch_ids(batch, resolve_failures)
-            if stop_message:
-                self.events.put(("query_blocked", (completed, total, stop_message)))
-                return
-            if not batch:
-                completed += resolve_failures
+        try:
+            store = AccountStore(db_path)
+        except Exception as exc:
+            self.events.put(("query_blocked", (completed, total, f"无法打开账号数据库：{exc}")))
+            return
+        try:
+            for original_batch in AccountStore.account_batches(db_path, account_ids):
+                batch, resolve_failures, stop_message, handled = self._resolve_batch_ids(
+                    original_batch, resolve_failures, store
+                )
+                if stop_message:
+                    # 已解析成功但尚未查询的条目不能被算作“完成”。
+                    self.events.put(("query_blocked", (completed + handled - len(batch), total, stop_message)))
+                    return
+                if not batch:
+                    completed += handled
+                    self.events.put(("query_progress", (completed, total)))
+                    continue
+                result_batch = []
+                try:
+                    response = request_player_bans(api_key, [account.steam_id for account in batch])
+                    for account in batch:
+                        player = response.get(account.steam_id)
+                        if player is None:
+                            result_batch.append((account.account_id, None, "Steam API 未返回该 SteamID64 的结果"))
+                        else:
+                            result_batch.append((account.account_id, player, ""))
+                except SteamApiFatalError as exc:
+                    self.events.put(("query_blocked", (completed, total, str(exc))))
+                    return
+                except Exception as exc:
+                    self.events.put(("query_blocked", (completed, total, f"查询程序发生未预期错误：{exc}")))
+                    return
+                self.events.put(("result_batch", result_batch))
+                completed += handled
                 self.events.put(("query_progress", (completed, total)))
-                continue
-            result_batch = []
-            try:
-                response = request_player_bans(api_key, [account.steam_id for account in batch])
-                for account in batch:
-                    player = response.get(account.steam_id)
-                    if player is None:
-                        result_batch.append((account.account_id, None, "Steam API 未返回该 SteamID64 的结果"))
-                    else:
-                        result_batch.append((account.account_id, player, ""))
-            except SteamApiFatalError as exc:
-                self.events.put(("query_blocked", (completed, total, str(exc))))
-                return
-            except Exception as exc:
-                self.events.put(("query_blocked", (completed, total, f"查询程序发生未预期错误：{exc}")))
-                return
-            self.events.put(("result_batch", result_batch))
-            completed += len(batch)
-            self.events.put(("query_progress", (completed, total)))
-            if completed < total:
-                time.sleep(0.35)
-        self.events.put(("query_done", total))
+                if completed < total:
+                    time.sleep(0.35)
+            self.events.put(("query_done", total))
+        except Exception as exc:
+            self.events.put(("query_blocked", (completed, total, f"查询程序发生未预期错误：{exc}")))
+        finally:
+            store.close()
 
     def _drain_events(self) -> None:
         changed = False
@@ -2707,7 +2753,8 @@ class SteamBanApp:
                     self._set_controls(not self.import_running)
                     self.status_var.set(f"查询已停止：已完成 {completed} / {total} 条；没有把未查询账号标记为失败。")
                     messagebox.showerror(APP_NAME, message, parent=self.root)
-                    changed = completed > 0
+                    # SteamID 解析失败会由工作线程直接写入独立连接；即使没有 API 成功结果也要刷新列表。
+                    changed = True
                 elif kind == "import_progress":
                     extra = f"；已加密保存密码 {payload['passwords_saved']} 条" if payload["passwords_saved"] else ""
                     self.status_var.set(
@@ -2795,6 +2842,21 @@ def run_self_test() -> None:
         assert row["pubg_assessment"] == "存在游戏封禁（未证明 PUBG）"
         store.close()
 
+        # 仅库存封禁必须被“有风险”筛选命中，且不能被归入“无风险”。
+        economy_store = AccountStore(root / "economy.sqlite3")
+        economy_id = economy_store.upsert_account("库存限制", "76561198000000001", "")
+        economy_store.save_result(economy_id, {
+            "VACBanned": False,
+            "NumberOfVACBans": 0,
+            "DaysSinceLastBan": 0,
+            "NumberOfGameBans": 0,
+            "CommunityBanned": False,
+            "EconomyBan": "probation",
+        })
+        assert economy_store.count_accounts("risk") == 1
+        assert economy_store.count_accounts("safe") == 0
+        economy_store.close()
+
         fixture = root / "large_fixture.csv"
         with fixture.open("w", encoding="utf-8-sig", newline="") as file:
             writer = csv.writer(file)
@@ -2816,6 +2878,35 @@ def run_self_test() -> None:
         assert large_store.account_password(int(first["id"])) == expected_password
         assert expected_password not in (root / "large.sqlite3").read_text(encoding="latin-1")
         large_store.close()
+
+        # CSV：支持账号+密码、没有 SteamID64 的表头格式；导入后保留占位 ID。
+        account_password_csv = root / "account_password.csv"
+        account_password_csv.write_text("account,password\ncsv-user,csv-pass\n", encoding="utf-8")
+        account_password_stats = AccountStore.import_file(
+            root / "account_password.sqlite3", account_password_csv, threading.Event(), lambda _update: None
+        )
+        assert account_password_stats["imported"] == 1, account_password_stats
+        account_password_store = AccountStore(root / "account_password.sqlite3")
+        account_password_row = account_password_store.list_accounts_page(0, 10)[0][0]
+        assert account_password_row["steam_id"] == "csv-user"
+        assert account_password_store.account_password(int(account_password_row["id"])) == "csv-pass"
+        account_password_store.close()
+
+        # 无表头 CSV 的第一行也是数据，不能因为布局检测而被跳过。
+        headerless_csv = root / "headerless.csv"
+        headerless_csv.write_text(
+            "first-user,76561198000000002,first-note\nsecond-user,76561198000000003,second-note\n",
+            encoding="utf-8",
+        )
+        headerless_stats = AccountStore.import_file(
+            root / "headerless.sqlite3", headerless_csv, threading.Event(), lambda _update: None
+        )
+        assert headerless_stats["imported"] == 2, headerless_stats
+        headerless_store = AccountStore(root / "headerless.sqlite3")
+        assert {row["account_name"] for row in headerless_store.list_accounts_page(0, 10)[0]} == {
+            "first-user", "second-user"
+        }
+        headerless_store.close()
 
         # TXT：账号----密码（没有 SteamID64，先用账号名占位）
         txt_fixture = root / "accounts.txt"
@@ -2862,6 +2953,16 @@ def run_self_test() -> None:
         csv_path = root / "export.csv"
         assert write_account_export(csv_path, exported_rows) == 3
         assert "pass-one" in csv_path.read_text(encoding="utf-8-sig")
+        csv_round_trip = AccountStore.import_file(
+            root / "csv_roundtrip.sqlite3", csv_path, threading.Event(), lambda _update: None
+        )
+        assert csv_round_trip["imported"] == 3, csv_round_trip
+        csv_round_store = AccountStore(root / "csv_roundtrip.sqlite3")
+        csv_rows = {row["account_name"]: row for row in csv_round_store.list_accounts_page(0, 10)[0]}
+        assert csv_rows["user-one"]["steam_id"] == "76561190000000001"
+        assert csv_rows["user-one"]["note"] == ""
+        assert csv_round_store.account_password(int(csv_rows["user-one"]["id"])) == "pass-one"
+        csv_round_store.close()
         json_path = root / "export.json"
         assert write_account_export(json_path, exported_rows) == 3
         assert {item["account"]: item["password"] for item in json.loads(json_path.read_text(encoding="utf-8"))}["user-two"] == "pass-two"
@@ -2884,6 +2985,73 @@ def run_self_test() -> None:
         assert key_store.load() == test_key
         key_store.clear()
         assert not (root / "settings.json").exists()
+
+        # 未解析的账号名绝不能作为 SteamID64 写进 Steam 的配置文件。
+        try:
+            steam_login.write_auto_login(str(root / "steam.exe"), "not-a-steam-id", "test-user")
+            raise AssertionError("Invalid SteamID64 was accepted for loginusers.vdf")
+        except ValueError:
+            pass
+
+        # 解析 SteamID64 的查询路径必须使用工作线程独享的 SQLite 连接。
+        query_fixture = root / "query.txt"
+        query_fixture.write_text("query-user----query-pass\n", encoding="utf-8")
+        AccountStore.import_file(root / "query.sqlite3", query_fixture, threading.Event(), lambda _update: None)
+        query_app = SteamBanApp.__new__(SteamBanApp)
+        query_app.events = queue.Queue()
+        saved_resolver = steam_login.resolve_steam_id
+        saved_requester = request_player_bans
+        try:
+            steam_login.resolve_steam_id = lambda account, password: "76561198000000004"
+            globals()["request_player_bans"] = lambda _key, ids: {
+                ids[0]: {
+                    "SteamId": ids[0], "VACBanned": False, "NumberOfVACBans": 0,
+                    "DaysSinceLastBan": 0, "NumberOfGameBans": 0,
+                    "CommunityBanned": False, "EconomyBan": "none",
+                }
+            }
+            query_thread = threading.Thread(
+                target=query_app._query_worker,
+                args=("test-key", None, 1, root / "query.sqlite3"),
+            )
+            query_thread.start()
+            query_thread.join()
+        finally:
+            steam_login.resolve_steam_id = saved_resolver
+            globals()["request_player_bans"] = saved_requester
+        query_events = []
+        while not query_app.events.empty():
+            query_events.append(query_app.events.get_nowait())
+        assert query_events[-1] == ("query_done", 1), query_events
+        query_store = AccountStore(root / "query.sqlite3")
+        query_row = query_store.list_accounts_page(0, 1)[0][0]
+        assert query_row["steam_id"] == "76561198000000004"
+        query_store.close()
+
+        # 没有 SteamID64 时，自动登录仅跳过配置写入，仍可走客户端登录与密码填充。
+        login_app = SteamBanApp.__new__(SteamBanApp)
+        login_app.events = queue.Queue()
+        login_calls = []
+        saved_shutdown = steam_login.shutdown_steam
+        saved_write_auto_login = steam_login.write_auto_login
+        saved_tweaks = steam_login.apply_login_tweaks
+        saved_launch = steam_login.launch_login
+        saved_automate = steam_login.automate_steam_login
+        try:
+            steam_login.shutdown_steam = lambda _exe: login_calls.append("shutdown") or True
+            steam_login.write_auto_login = lambda *_args: login_calls.append("write_auto_login")
+            steam_login.apply_login_tweaks = lambda *_args: login_calls.append("tweaks") or []
+            steam_login.launch_login = lambda *_args: login_calls.append("launch")
+            steam_login.automate_steam_login = lambda _password: login_calls.append("automate") or "已提交"
+            login_app._steam_login_worker("steam.exe", "placeholder-user", "placeholder-user", "password")
+        finally:
+            steam_login.shutdown_steam = saved_shutdown
+            steam_login.write_auto_login = saved_write_auto_login
+            steam_login.apply_login_tweaks = saved_tweaks
+            steam_login.launch_login = saved_launch
+            steam_login.automate_steam_login = saved_automate
+        assert login_calls == ["shutdown", "launch", "automate"], login_calls
+        assert login_app.events.get_nowait()[0] == "steam_login_done"
     print("self-test passed")
 
 if __name__ == '__main__':

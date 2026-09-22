@@ -102,6 +102,9 @@ def write_auto_login(steam_exe: str, steam_id: str, account_name: str) -> Path:
 
     写入前备份为 loginusers.vdf.bak；解析不到任何已有账号时放弃写入，避免清空账号列表。
     """
+    steam_id = str(steam_id or '').strip()
+    if not re.fullmatch(r'\d{17}', steam_id):
+        raise ValueError('SteamID64 必须是 17 位数字；未解析的账号不能改写 loginusers.vdf')
     path = loginusers_path(steam_exe)
     raw = path.read_bytes() if path.is_file() else b""
     bom = raw.startswith(b"\xef\xbb\xbf")
@@ -182,6 +185,9 @@ VDF_TOKEN_RE = re.compile(r'"(?:[^"\\]|\\.)*"|\{|\}|//[^\n]*')
 
 def account_id_from_steam_id(steam_id64: str) -> str:
     """SteamID64 换算成 32 位账号 ID，也就是 userdata 目录名。"""
+    steam_id64 = str(steam_id64 or '').strip()
+    if not re.fullmatch(r'\d{17}', steam_id64):
+        raise ValueError('SteamID64 必须是 17 位数字')
     return str(int(steam_id64) - ACCOUNT_ID_OFFSET)
 
 
