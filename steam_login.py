@@ -467,6 +467,8 @@ LOGIN_WINDOW_TITLES = ('登录 Steam', 'Sign in to Steam', 'Steam 登录', '登�
 LOGIN_WINDOW_TITLE_EXCLUDES = ('更新', 'updat', 'bootstrapper', 'install', 'waiting')
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STEAM_LOGIN_PROCESS_NAMES = frozenset({'steam.exe', 'steamwebhelper.exe'})
 
 
 def _user32():
@@ -490,8 +492,56 @@ def _is_login_window_title(title: str) -> bool:
     return not any(marker in lowered for marker in LOGIN_WINDOW_TITLE_EXCLUDES)
 
 
-def _find_login_window():
-    """找到 Steam 的登录窗口句柄；没找到返回 0。"""
+def _window_process_image(hwnd: int) -> str | None:
+    """返回顶层窗口所属进程的完整可执行文件路径；查询失败时不信任该窗口。"""
+    if os.name != 'nt':
+        return None
+    user32 = _user32()
+    process_id = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(process_id))
+    if not process_id.value:
+        return None
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, process_id.value)
+    if not process:
+        return None
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = wintypes.DWORD(len(buffer))
+        if not kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(length)):
+            return None
+        return buffer.value
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def _is_expected_steam_process_image(process_image: str | None, steam_exe: str) -> bool:
+    """只接受当前 Steam 安装目录中的 steam.exe / steamwebhelper.exe 窗口。
+
+    单靠标题包含“Steam”会把浏览器中的 Steam Community 页面误认为登录框，密码可能被
+    粘贴到网页。登录窗口属于 Steam 安装目录内的进程，这个路径校验是输入注入前的硬门槛。
+    """
+    if not process_image or not steam_exe:
+        return False
+    candidate = Path(process_image)
+    expected_directory = os.path.normcase(os.path.normpath(str(Path(steam_exe).parent)))
+    actual_directory = os.path.normcase(os.path.normpath(str(candidate.parent)))
+    return candidate.name.casefold() in STEAM_LOGIN_PROCESS_NAMES and actual_directory == expected_directory
+
+
+def _find_login_window(steam_exe: str) -> int:
+    """找到当前 Steam 安装目录所属的登录窗口句柄；没找到返回 0。
+
+    标题只能用于缩小范围，不能作为身份认证。任何无法验证进程路径的窗口一律跳过。
+    """
     user32 = _user32()
     found = []
 
@@ -500,7 +550,10 @@ def _find_login_window():
             length = user32.GetWindowTextLengthW(hwnd)
             buffer = ctypes.create_unicode_buffer(length + 2)
             user32.GetWindowTextW(hwnd, buffer, length + 2)
-            if _is_login_window_title(buffer.value):
+            if (
+                _is_login_window_title(buffer.value)
+                and _is_expected_steam_process_image(_window_process_image(hwnd), steam_exe)
+            ):
                 found.append(hwnd)
         return True
 
@@ -548,7 +601,7 @@ def _paste() -> None:
     _key(0x11, True)
 
 
-def automate_steam_login(password: str, timeout: float = 150.0) -> str:
+def automate_steam_login(password: str, steam_exe: str, timeout: float = 150.0) -> str:
     """等 Steam 登录窗口出现后自动填入密码并提交；返回给用户看的说明。"""
     if os.name != 'nt':
         return '自动填密码仅支持 Windows'
@@ -556,7 +609,7 @@ def automate_steam_login(password: str, timeout: float = 150.0) -> str:
     deadline = time.time() + timeout
     hwnd = 0
     while time.time() < deadline:
-        hwnd = _find_login_window()
+        hwnd = _find_login_window(steam_exe)
         if hwnd:
             break
         time.sleep(1.5)
@@ -569,29 +622,31 @@ def automate_steam_login(password: str, timeout: float = 150.0) -> str:
         return 'Steam 登录窗口没能切到前台，已跳过自动填密码'
     if not _set_clipboard(password):
         return '剪贴板不可用，已跳过自动填密码'
-    for attempt in range(3):
-        time.sleep(0.5)
-        if attempt == 1:
-            _press(0x09)                 # Tab：从账号框挪到密码框
-        elif attempt == 2:               # 最后一招：点窗口偏下一点的输入框位置
-            rect = ctypes.wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            x = int(rect.left + (rect.right - rect.left) * 0.5)
-            y = int(rect.top + (rect.bottom - rect.top) * 0.42)
-            user32.SetCursorPos(x, y)
-            time.sleep(0.2)
-            user32.mouse_event(0x0002, 0, 0, 0, 0)
-            user32.mouse_event(0x0004, 0, 0, 0, 0)
-        _paste()
-        time.sleep(0.6)
-        _press(0x0D)                     # Enter
-        for _ in range(8):
-            time.sleep(1.0)
-            if not user32.IsWindow(hwnd):
-                _clear_clipboard()
-                return '已自动填入密码并提交'
-    _clear_clipboard()
-    return '已填入密码，但 Steam 还停在登录窗口（可能需要 Steam Guard 验证码）'
+    try:
+        for attempt in range(3):
+            time.sleep(0.5)
+            if attempt == 1:
+                _press(0x09)                 # Tab：从账号框挪到密码框
+            elif attempt == 2:               # 最后一招：点窗口偏下一点的输入框位置
+                rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                x = int(rect.left + (rect.right - rect.left) * 0.5)
+                y = int(rect.top + (rect.bottom - rect.top) * 0.42)
+                user32.SetCursorPos(x, y)
+                time.sleep(0.2)
+                user32.mouse_event(0x0002, 0, 0, 0, 0)
+                user32.mouse_event(0x0004, 0, 0, 0, 0)
+            _paste()
+            time.sleep(0.6)
+            _press(0x0D)                     # Enter
+            for _ in range(8):
+                time.sleep(1.0)
+                if not user32.IsWindow(hwnd):
+                    return '已自动填入密码并提交'
+        return '已填入密码，但 Steam 还停在登录窗口（可能需要 Steam Guard 验证码）'
+    finally:
+        # 任一 Win32 调用异常、线程被上层捕获或登录窗口消失时都不能把密码留在剪贴板。
+        _clear_clipboard()
 
 
 # ---------------------------------------------------------------------------
