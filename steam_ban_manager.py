@@ -34,7 +34,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.2.4"
+APP_VERSION = "4.1.0"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
@@ -72,6 +72,12 @@ API_URLS = (
 
 PUBG_APP_ID = 578080
 CONSERVATIVE_BATCH_SIZE = 100
+
+# 解析 SteamID64 要连 api.steampowered.com：网络抖动、代理超时、Steam 限流都值得重试；
+# 密码错误、需要令牌验证码这类错误重试没有意义，立刻放弃。
+RESOLVE_ATTEMPTS = 3
+RESOLVE_RETRY_DELAY = 4.0
+RESOLVE_RETRY_WORDS = ('限流', '频繁', 'timed out', 'timeout', 'Network', 'network', 'HTTP 5', '连接失败')
 IMPORT_DB_BATCH_SIZE = 500
 TREE_LOAD_CHUNK = 5000
 
@@ -3870,6 +3876,15 @@ class SteamBanApp:
             daemon=True,
         ).start()
 
+    def _wait_resolve_retry(self, attempt: int) -> bool:
+        """解析失败后的退避等待；返回 False 表示用户取消了查询。"""
+        cancel_event = getattr(self, 'import_cancel_event', None)
+        seconds = RESOLVE_RETRY_DELAY * attempt
+        if cancel_event is None:
+            time.sleep(seconds)
+            return True
+        return not cancel_event.wait(seconds)
+
     def _resolve_batch_ids(
         self,
         batch: list,
@@ -3896,24 +3911,42 @@ class SteamBanApp:
                 store.save_result(account.account_id, None, "缺少密码，无法解析 SteamID64（请编辑该账号填入密码后重试）")
                 self.events.put(("resolve_progress", (name, completed_before_batch + handled, total)))
                 continue
-            try:
-                real_id = steam_login.resolve_steam_id(name, password)
-            except steam_login.SteamAuthError as exc:
+            # 解析要连 api.steampowered.com：网络抖动、代理超时、Steam 限流都可能让单次失败。
+            # 这几类错误等一会儿重试；密码错误、需要验证码这类错误立刻放弃，不浪费尝试次数。
+            real_id = ''
+            last_error: Exception | None = None
+            for attempt in range(1, RESOLVE_ATTEMPTS + 1):
+                if attempt > 1:
+                    self.events.put(("resolve_progress", (name, completed_before_batch + handled, total)))
+                    if not self._wait_resolve_retry(attempt):
+                        break
+                try:
+                    real_id = steam_login.resolve_steam_id(name, password)
+                    break
+                except steam_login.SteamAuthError as exc:
+                    last_error = exc
+                    message = str(exc)
+                    retryable = any(word in message for word in RESOLVE_RETRY_WORDS)
+                    if not retryable:
+                        break
+                except Exception as exc:                 # 网络中断/超时等
+                    last_error = exc
+            if not real_id:
                 failures += 1
-                store.save_result(account.account_id, None, f"无法解析 SteamID64：{exc}")
+                reason = str(last_error) if last_error is not None else '未知错误'
+                store.save_result(
+                    account.account_id, None,
+                    f"无法解析 SteamID64（账号 {name}，已重试 {RESOLVE_ATTEMPTS} 次）：{reason}",
+                )
                 self.events.put(("resolve_progress", (name, completed_before_batch + handled, total)))
                 if failures >= 5:
                     return (
                         resolved,
                         failures,
-                        f"连续 {failures} 个账号解析 SteamID64 失败（最后一次：{exc}）。已停止，请检查账号密码或稍后再试。",
+                        f"连续 {failures} 个账号解析 SteamID64 失败（最后一次：{reason}）。已停止；"
+                        "请检查账号密码是否正确、网络/代理是否放行 api.steampowered.com，或稍后再试。",
                         handled,
                     )
-                continue
-            except Exception as exc:
-                failures += 1
-                store.save_result(account.account_id, None, f"无法解析 SteamID64：{exc!r}")
-                self.events.put(("resolve_progress", (name, completed_before_batch + handled, total)))
                 continue
             failures = 0
             if store.update_steam_id(account.account_id, real_id):
@@ -4129,7 +4162,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v3.2.4") == (3, 2, 4)
+    assert version_key("v4.1.0") == (4, 1, 0)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -4770,6 +4803,58 @@ def run_self_test() -> None:
         finally:
             steam_login.resolve_steam_id = saved_resolver
             globals()["request_player_bans"] = saved_requester
+
+        # 网络抖动/限流要重试：前两次抛网络错误，第三次成功，账号最终仍要解析出 SteamID64。
+        retry_fixture = root / "retry.txt"
+        retry_fixture.write_text("retry-user----retry-pass\n", encoding="utf-8")
+        AccountStore.import_file(root / "retry.sqlite3", retry_fixture, threading.Event(), lambda _update: None)
+        retry_app = SteamBanApp.__new__(SteamBanApp)
+        retry_app.events = queue.Queue()
+        retry_calls = {"count": 0}
+
+        def flaky_resolver(_account, _password):
+            retry_calls["count"] += 1
+            if retry_calls["count"] < 3:
+                raise URLError("timed out")
+            return "76561198000000005"
+
+        saved_resolver = steam_login.resolve_steam_id
+        saved_requester = request_player_bans
+        saved_attempts = RESOLVE_ATTEMPTS
+        saved_delay = RESOLVE_RETRY_DELAY
+        try:
+            steam_login.resolve_steam_id = flaky_resolver
+            globals()["request_player_bans"] = lambda _key, ids: {
+                ids[0]: {
+                    "SteamId": ids[0], "VACBanned": False, "NumberOfVACBans": 0,
+                    "DaysSinceLastBan": 0, "NumberOfGameBans": 0,
+                    "CommunityBanned": False, "EconomyBan": "none",
+                }
+            }
+            globals()["RESOLVE_ATTEMPTS"] = 3
+            globals()["RESOLVE_RETRY_DELAY"] = 0.01
+            retry_thread = threading.Thread(
+                target=retry_app._query_worker,
+                args=("test-key", None, 1, root / "retry.sqlite3"),
+            )
+            retry_thread.start()
+            retry_thread.join()
+        finally:
+            steam_login.resolve_steam_id = saved_resolver
+            globals()["request_player_bans"] = saved_requester
+            globals()["RESOLVE_ATTEMPTS"] = saved_attempts
+            globals()["RESOLVE_RETRY_DELAY"] = saved_delay
+        assert retry_calls["count"] == 3, retry_calls
+        # 查询结果由工作线程投递给界面线程保存，headless 下只断言"解析成功 + 确实投递了结果"。
+        retry_events = []
+        while not retry_app.events.empty():
+            retry_events.append(retry_app.events.get_nowait())
+        retry_kinds = [kind for kind, _payload in retry_events]
+        assert "result_batch" in retry_kinds and "query_done" in retry_kinds, retry_kinds
+        retry_store = AccountStore(root / "retry.sqlite3")
+        retry_row = retry_store.connection.execute("SELECT steam_id FROM accounts LIMIT 1").fetchone()
+        retry_store.close()
+        assert retry_row["steam_id"] == "76561198000000005", dict(retry_row)
         query_events = []
         while not query_app.events.empty():
             query_events.append(query_app.events.get_nowait())
