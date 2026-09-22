@@ -166,14 +166,14 @@ def shutdown_steam(steam_exe: str, timeout: float = 40.0) -> bool:
 def launch_login(steam_exe: str, account: str, password: str) -> subprocess.Popen:
     """用命令行登录参数启动 Steam（账号密码自动填入，无需手输）。
 
-    与 V9 切换器一致地带上 -noreactlogin：强制走旧版登录框，账号密码参数才会被直接采用。
+    带上 -noreactlogin：强制走旧版登录框，账号密码参数才会被直接采用。
     """
     return subprocess.Popen([steam_exe, "-noreactlogin", "-login", account, password],
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 # ---------------------------------------------------------------------------
-# Steam 客户端设置写入（对应 V9 切换器里的“登录首页改为库 / 关闭推销广告弹窗 /
-# 关闭好友列表弹窗”，写的都是 Steam 自己的配置文件）
+# Steam 客户端设置写入（登录首页改为库 / 关闭推销广告弹窗 / 关闭好友列表弹窗，
+# 写的都是 Steam 自己的配置文件）
 # ---------------------------------------------------------------------------
 
 ACCOUNT_ID_OFFSET = 76561197960265728
@@ -448,7 +448,7 @@ def _sync_remotecache(account_dir: Path, backup_dir: Path) -> None:
 #
 # 实测（2026-09）：现在的 Steam 客户端不再接受命令行上的密码，
 # "steam.exe -noreactlogin -login 账号 密码" 只会把账号名填好并弹出「登录 Steam」窗口。
-# 参考工具（V9 切换器 / Steam账号管家）都是靠 Win32 输入注入把密码打进这个窗口的，
+# 这类工具都是靠 Win32 输入注入把密码打进这个窗口的，
 # 这里用同样的办法：找到窗口 → 切到前台 → 粘贴密码 → 回车。
 # ---------------------------------------------------------------------------
 
