@@ -125,7 +125,7 @@ def write_auto_login(steam_exe: str, steam_id: str, account_name: str) -> Path:
 
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, "AutoLoginUser", 0, winreg.REG_SZ, account_name)
-            # Steam 账号切换器（V9）会同时写这几个值：记住密码 + 允许自动登录，
+            # 这几个注册表值配合 loginusers.vdf，让 Steam 记住密码并允许自动登录，
             # 这样下次切换回该账号时 Steam 会用缓存的令牌直接进去，不用再传密码。
             winreg.SetValueEx(key, "AutoLoginUser_steamchina", 0, winreg.REG_SZ, account_name)
             winreg.SetValueEx(key, "RememberPassword", 0, winreg.REG_DWORD, 1)
@@ -175,7 +175,7 @@ def shutdown_steam(steam_exe: str, timeout: float = 40.0) -> bool:
 
 
 def launch_login(steam_exe: str, account: str, password: str = '') -> subprocess.Popen:
-    """带账号密码直接启动 Steam（这就是 Steam 账号切换器类工具的标准做法）。
+    """带账号密码直接启动 Steam（命令行登录，Steam 会直接完成登录，无需模拟输入）。
 
     实测（2026-09，本机 Steam）：steam.exe -noreactlogin -login 账号 密码 会在 10 秒左右
     直接登录成功，完全不需要模拟键盘或鼠标；不带密码时 Steam 只会弹出登录框并停在那里。
@@ -490,7 +490,7 @@ LOGIN_CONNECTION_WAIT = 45.0
 # 命令行带上密码后，Steam 通常 5~10 秒就登录完成；给它 60 秒上限。
 LOGIN_COMMAND_TIMEOUT = 60.0
 # 命令行带上账号密码后 Steam 通常 5~10 秒自己就登录成功了。登录窗口只是过程中的旧版
-# 对话框，先给它这段时间；真的登录成功就完全不需要模拟键盘鼠标（这也正是 V9 的做法）。
+# 对话框，先给它这段时间；真的登录成功就完全不需要模拟键盘鼠标。
 LOGIN_COMMAND_GRACE = 20.0
 LOGIN_PROGRESS_INTERVAL = 2.0
 LOGIN_FORM_READY_DELAY = 2.5

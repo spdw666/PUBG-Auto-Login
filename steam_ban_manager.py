@@ -4295,7 +4295,7 @@ def run_self_test() -> None:
         ) is False
         # 启动 Steam 的命令行里不能再出现密码。
         import inspect as _inspect
-        # 账号密码是随命令行传给 Steam 的（Steam 账号切换器 V9 的做法）：实测 10 秒内直接
+        # 账号密码随命令行传给 Steam（命令行登录）：实测 10 秒内直接
         # 登录成功，不需要模拟键盘鼠标；没有缓存令牌的新账号也能登录。
         assert 'password' in str(_inspect.signature(steam_login.launch_login))
         assert hasattr(steam_login.wintypes, 'DWORD')
