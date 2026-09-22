@@ -15,6 +15,7 @@ import re
 import subprocess
 import threading
 import time
+from typing import Callable
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -470,7 +471,8 @@ CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 STEAM_LOGIN_PROCESS_NAMES = frozenset({'steam.exe', 'steamwebhelper.exe'})
-LOGIN_WINDOW_TIMEOUT = 45.0
+LOGIN_WINDOW_TIMEOUT = 180.0
+LOGIN_PROGRESS_INTERVAL = 2.0
 LOGIN_FORM_READY_DELAY = 2.5
 LOGIN_SUBMIT_RESULT_WAIT = 15.0
 # ``import ctypes.wintypes`` 只会把模块挂在 ctypes 命名空间；下面的 Win32 调用使用
@@ -813,27 +815,102 @@ def _raise_if_login_cancelled(cancel_event: threading.Event | None) -> None:
         raise LoginAutomationCancelled('已取消自动登录等待。')
 
 
+def active_login_account_id() -> int | None:
+    r"""读取 Steam 自己记录的当前登录账号（32 位账号 ID）；未登录返回 None。
+
+    Steam 登录成功后会写 HKCU\Software\Valve\Steam\ActiveProcess\ActiveUser，
+    这是判断“它已经自己进去了”最可靠的信号。
+    """
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam\ActiveProcess') as key:
+            value, _kind = winreg.QueryValueEx(key, 'ActiveUser')
+        return int(value) or None
+    except (OSError, ValueError):
+        return None
+
+
+def steam_is_connecting(steam_exe: str, max_age: float = 180.0) -> bool:
+    """从 Steam 自己的 connection_log.txt 判断它是不是还卡在连接服务器。
+
+    登录窗口迟迟不出现时用它区分两种情况：网络/代理导致 Steam 连不上（要用户处理），
+    还是 Steam 已经用记住的登录信息进去了。
+    """
+    log_path = Path(steam_exe).parent / 'logs' / 'connection_log.txt'
+    try:
+        if not log_path.is_file():
+            return False
+        stat = log_path.stat()
+        if time.time() - stat.st_mtime > max_age:
+            return False
+        with log_path.open('rb') as handle:
+            handle.seek(max(0, stat.st_size - 65536))
+            tail = handle.read().decode('utf-8', 'replace')
+    except OSError:
+        return False
+    recent = tail.splitlines()[-80:]
+    if any('[Logged On' in line for line in recent):
+        return False
+    return any(
+        ('[Connecting' in line) or ('PingWebSocketCM' in line) or ('YieldingConnect' in line)
+        for line in recent
+    )
+
+
+def wait_for_steam_login(
+    steam_exe: str,
+    timeout: float = LOGIN_WINDOW_TIMEOUT,
+    cancel_event: threading.Event | None = None,
+    progress: Callable[[float], None] | None = None,
+) -> tuple[str, int]:
+    """等 Steam 进入可处理状态，返回 (状态, 句柄或账号 ID)。
+
+    logged_in    —— Steam 已经用本机记住的登录信息自己进去了（loginusers.vdf + 注册表那条路），不需要密码
+    login_window —— 出现登录窗口，需要注入密码
+    timeout      —— 都没有等到（常见于本机没有该账号的缓存令牌 + 网络慢/连不上）
+    """
+    started = time.time()
+    deadline = started + max(1.0, timeout)
+    last_report = 0.0
+    while time.time() < deadline:
+        _raise_if_login_cancelled(cancel_event)
+        account_id = active_login_account_id()
+        if account_id:
+            return 'logged_in', account_id
+        hwnd = _find_login_window(steam_exe)
+        if hwnd:
+            return 'login_window', hwnd
+        elapsed = time.time() - started
+        if progress is not None and elapsed - last_report >= LOGIN_PROGRESS_INTERVAL:
+            last_report = elapsed
+            progress(elapsed)
+        if _wait_or_cancel(cancel_event, 0.5):
+            _raise_if_login_cancelled(cancel_event)
+    return 'timeout', 0
+
+
 def automate_steam_login(
     password: str,
     steam_exe: str,
     timeout: float = LOGIN_WINDOW_TIMEOUT,
     cancel_event: threading.Event | None = None,
+    progress: Callable[[float], None] | None = None,
 ) -> str:
-    """等 Steam 登录窗口出现后自动填入密码并提交；返回给用户看的说明。"""
+    """等 Steam 自己登录或弹出登录窗口；只有后者才需要注入密码。"""
     if os.name != 'nt':
         return '自动填密码仅支持 Windows'
-    user32 = _user32()
-    deadline = time.time() + timeout
-    hwnd = 0
-    while time.time() < deadline:
-        _raise_if_login_cancelled(cancel_event)
-        hwnd = _find_login_window(steam_exe)
-        if hwnd:
-            break
-        if _wait_or_cancel(cancel_event, 1.0):
-            _raise_if_login_cancelled(cancel_event)
-    if not hwnd:
-        return f'{int(timeout)} 秒内没有等到 Steam 登录窗口（可能已经用记住的登录信息直接进去了）'
+    state, value = wait_for_steam_login(steam_exe, timeout, cancel_event, progress)
+    if state == 'logged_in':
+        # loginusers.vdf + 注册表 AutoLoginUser 这条路生效了：Steam 用本机缓存的登录信息直接进去，不需要密码。
+        return '已用本机记住的登录信息自动登录成功（loginusers.vdf + 注册表），本次没有使用密码'
+    if state == 'timeout':
+        if steam_is_connecting(steam_exe):
+            return (f'等不到登录窗口：Steam 自己还没有连上 Steam 服务器（{int(timeout)} 秒）。'
+                    '这通常是因为代理/VPN 拦了 Steam 的连接：请把 Steam 相关域名（steamserver.net、'
+                    'steampowered.com、steamcommunity.com）设为直连后重试，或直接手动登录。')
+        return f'{int(timeout)} 秒内没有等到 Steam 登录窗口，也没检测到 Steam 已登录；请查看 Steam 窗口状态后重试'
+    hwnd = value
     user32 = _user32()
     if not _bring_to_foreground(hwnd):
         return 'Steam 登录窗口没能切到前台，已跳过自动填密码；请手动点一下 Steam 窗口后重试'

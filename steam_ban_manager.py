@@ -34,7 +34,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.1"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
@@ -3246,7 +3246,14 @@ class SteamBanApp:
                 self.events.put(("steam_login_cancelled", None))
                 return
             steam_login.launch_login(steam_exe, account_name)
-            login_result = steam_login.automate_steam_login(password, steam_exe, cancel_event=cancel_event)
+
+            def login_progress(elapsed: float) -> None:
+                # 后台线程只投递事件，界面文案在主线程更新，避免跨线程操作控件。
+                self.events.put(("steam_login_waiting", elapsed))
+
+            login_result = steam_login.automate_steam_login(
+                password, steam_exe, cancel_event=cancel_event, progress=login_progress
+            )
         except steam_login.LoginAutomationCancelled:
             self.events.put(("steam_login_cancelled", None))
             return
@@ -4059,6 +4066,12 @@ class SteamBanApp:
                     account_id, logged_out_at = payload
                     self.store.mark_account_logged_out(account_id, logged_out_at)
                     changed = True
+                elif kind == "steam_login_waiting":
+                    if not (self.query_running or self.import_running or self.update_url):
+                        self.status_var.set(
+                            f"已启动 Steam，正在等它自动登录或弹出登录窗口（已等待 {int(payload)} 秒；"
+                            "经代理/VPN 时可能要 1-2 分钟，可随时点“取消登录”）…"
+                        )
                 elif kind == "steam_login_done":
                     account_id, logged_in_at, message = payload
                     self.login_running = False
@@ -4106,7 +4119,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v3.1.9") == (3, 1, 9)
+    assert version_key("v3.2.1") == (3, 2, 1)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -4349,6 +4362,35 @@ def run_self_test() -> None:
             raise AssertionError('已取消的登录等待不应继续执行')
         except steam_login.LoginAutomationCancelled:
             pass
+        # 等待逻辑：Steam 自己登录（注册表 ActiveUser）优先于弹登录窗口；两者都没有才算超时。
+        saved_active_account = steam_login.active_login_account_id
+        saved_find_window = steam_login._find_login_window
+        try:
+            steam_login.active_login_account_id = lambda: 791798680
+            assert steam_login.wait_for_steam_login(expected_steam_exe, timeout=1.0) == ('logged_in', 791798680)
+            steam_login.active_login_account_id = lambda: None
+            steam_login._find_login_window = lambda _exe: 4242
+            assert steam_login.wait_for_steam_login(expected_steam_exe, timeout=1.0) == ('login_window', 4242)
+            steam_login._find_login_window = lambda _exe: 0
+            assert steam_login.wait_for_steam_login(expected_steam_exe, timeout=0.2) == ('timeout', 0)
+        finally:
+            steam_login.active_login_account_id = saved_active_account
+            steam_login._find_login_window = saved_find_window
+        # Steam 卡在连接服务器时，超时提示必须指出是网络/代理问题，而不是含糊的“没等到窗口”。
+        fake_steam_root = root / 'fake-steam'
+        (fake_steam_root / 'logs').mkdir(parents=True)
+        connection_log = fake_steam_root / 'logs' / 'connection_log.txt'
+        connection_log.write_text(
+            '[2026-09-22 16:23:16] [Connecting, 0, 7] [U:1:0] Client thinks it can connect\n'
+            '[2026-09-22 16:20:02] PingWebSocketCM() (cmp2-hkg1.steamserver.net:27025) starting...\n',
+            encoding='utf-8',
+        )
+        assert steam_login.steam_is_connecting(str(fake_steam_root / 'steam.exe')) is True
+        connection_log.write_text(
+            '[2026-09-22 16:24:00] [Logged On, 0, 0] [U:1:791798680] CCMInterface::SetSteamID( [U:1:791798680] )\n',
+            encoding='utf-8',
+        )
+        assert steam_login.steam_is_connecting(str(fake_steam_root / 'steam.exe')) is False
         # CEF 登录页的密码只能安全提交一次：后续 Tab/点击/粘贴会在页面状态已变化时破坏
         # 第一次正确提交。这里模拟窗口关闭，确认不再发送第二次粘贴、Tab 或 Enter。
         login_steps: list[tuple[str, Any]] = []
@@ -4380,6 +4422,7 @@ def run_self_test() -> None:
                 return 1
 
         saved_user32 = steam_login._user32
+        saved_active_login = steam_login.active_login_account_id
         saved_find_login_window = steam_login._find_login_window
         saved_set_clipboard = steam_login._set_clipboard
         saved_clear_clipboard = steam_login._clear_clipboard
@@ -4388,6 +4431,7 @@ def run_self_test() -> None:
         saved_wait_or_cancel = steam_login._wait_or_cancel
         try:
             steam_login._user32 = lambda: FakeLoginWindow()
+            steam_login.active_login_account_id = lambda: None
             steam_login._find_login_window = lambda _steam_exe: 4242
             steam_login._set_clipboard = lambda text: login_steps.append(('clipboard', text)) or True
             steam_login._clear_clipboard = lambda: login_steps.append(('clear', None))
@@ -4397,6 +4441,7 @@ def run_self_test() -> None:
             assert steam_login.automate_steam_login('single-submit-password', expected_steam_exe) == '已自动填入密码并提交'
         finally:
             steam_login._user32 = saved_user32
+            steam_login.active_login_account_id = saved_active_login
             steam_login._find_login_window = saved_find_login_window
             steam_login._set_clipboard = saved_set_clipboard
             steam_login._clear_clipboard = saved_clear_clipboard
