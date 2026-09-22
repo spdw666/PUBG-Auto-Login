@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -469,6 +470,14 @@ CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 STEAM_LOGIN_PROCESS_NAMES = frozenset({'steam.exe', 'steamwebhelper.exe'})
+LOGIN_WINDOW_TIMEOUT = 45.0
+# ``import ctypes.wintypes`` 只会把模块挂在 ctypes 命名空间；下面的 Win32 调用使用
+# wintypes.DWORD / HANDLE 等短名称，因此必须显式绑定，不能依赖 ctypes 的属性访问。
+wintypes = ctypes.wintypes
+
+
+class LoginAutomationCancelled(Exception):
+    """用户在等待 Steam 登录窗口时主动取消自动填密。"""
 
 
 def _user32():
@@ -524,17 +533,30 @@ def _window_process_image(hwnd: int) -> str | None:
 
 
 def _is_expected_steam_process_image(process_image: str | None, steam_exe: str) -> bool:
-    """只接受当前 Steam 安装目录中的 steam.exe / steamwebhelper.exe 窗口。
+    """只接受当前 Steam 安装目录的 steam.exe / steamwebhelper.exe 窗口。
 
     单靠标题包含“Steam”会把浏览器中的 Steam Community 页面误认为登录框，密码可能被
-    粘贴到网页。登录窗口属于 Steam 安装目录内的进程，这个路径校验是输入注入前的硬门槛。
+    粘贴到网页。steam.exe 必须正好是启动的那个文件；登录页通常由
+    ``bin\\cef\\...\\steamwebhelper.exe`` 承载，所以对 webhelper 允许安装目录树内的
+    子路径。这一校验是输入注入前的硬门槛。
     """
     if not process_image or not steam_exe:
         return False
     candidate = Path(process_image)
+    candidate_name = candidate.name.casefold()
+    if candidate_name not in STEAM_LOGIN_PROCESS_NAMES:
+        return False
+    expected_executable = os.path.normcase(os.path.normpath(str(Path(steam_exe))))
     expected_directory = os.path.normcase(os.path.normpath(str(Path(steam_exe).parent)))
-    actual_directory = os.path.normcase(os.path.normpath(str(candidate.parent)))
-    return candidate.name.casefold() in STEAM_LOGIN_PROCESS_NAMES and actual_directory == expected_directory
+    candidate_path = os.path.normcase(os.path.normpath(str(candidate)))
+    if candidate_name == 'steam.exe':
+        return candidate_path == expected_executable
+    try:
+        # commonpath 而不是字符串 startswith：D:\\Steam-old 不能被误当成 D:\\Steam 的子目录。
+        return os.path.commonpath((candidate_path, expected_directory)) == expected_directory
+    except ValueError:
+        # 不同盘符或非法路径不可能属于当前 Steam 安装目录。
+        return False
 
 
 def _find_login_window(steam_exe: str) -> int:
@@ -601,7 +623,25 @@ def _paste() -> None:
     _key(0x11, True)
 
 
-def automate_steam_login(password: str, steam_exe: str, timeout: float = 150.0) -> str:
+def _wait_or_cancel(cancel_event: threading.Event | None, seconds: float) -> bool:
+    """等待 seconds；若用户取消则立即返回 True。"""
+    if cancel_event is None:
+        time.sleep(seconds)
+        return False
+    return cancel_event.wait(seconds)
+
+
+def _raise_if_login_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise LoginAutomationCancelled('已取消自动登录等待。')
+
+
+def automate_steam_login(
+    password: str,
+    steam_exe: str,
+    timeout: float = LOGIN_WINDOW_TIMEOUT,
+    cancel_event: threading.Event | None = None,
+) -> str:
     """等 Steam 登录窗口出现后自动填入密码并提交；返回给用户看的说明。"""
     if os.name != 'nt':
         return '自动填密码仅支持 Windows'
@@ -609,22 +649,26 @@ def automate_steam_login(password: str, steam_exe: str, timeout: float = 150.0) 
     deadline = time.time() + timeout
     hwnd = 0
     while time.time() < deadline:
+        _raise_if_login_cancelled(cancel_event)
         hwnd = _find_login_window(steam_exe)
         if hwnd:
             break
-        time.sleep(1.5)
+        if _wait_or_cancel(cancel_event, 1.0):
+            _raise_if_login_cancelled(cancel_event)
     if not hwnd:
-        return '没有等到 Steam 登录窗口（可能已经用记住的登录信息直接进去了）'
+        return f'{int(timeout)} 秒内没有等到 Steam 登录窗口（可能已经用记住的登录信息直接进去了）'
     user32.ShowWindow(hwnd, 9)
     user32.SetForegroundWindow(hwnd)
-    time.sleep(1.2)
+    if _wait_or_cancel(cancel_event, 1.2):
+        _raise_if_login_cancelled(cancel_event)
     if user32.GetForegroundWindow() != hwnd:
         return 'Steam 登录窗口没能切到前台，已跳过自动填密码'
     if not _set_clipboard(password):
         return '剪贴板不可用，已跳过自动填密码'
     try:
         for attempt in range(3):
-            time.sleep(0.5)
+            if _wait_or_cancel(cancel_event, 0.5):
+                _raise_if_login_cancelled(cancel_event)
             if attempt == 1:
                 _press(0x09)                 # Tab：从账号框挪到密码框
             elif attempt == 2:               # 最后一招：点窗口偏下一点的输入框位置
@@ -633,14 +677,18 @@ def automate_steam_login(password: str, steam_exe: str, timeout: float = 150.0) 
                 x = int(rect.left + (rect.right - rect.left) * 0.5)
                 y = int(rect.top + (rect.bottom - rect.top) * 0.42)
                 user32.SetCursorPos(x, y)
-                time.sleep(0.2)
+                if _wait_or_cancel(cancel_event, 0.2):
+                    _raise_if_login_cancelled(cancel_event)
                 user32.mouse_event(0x0002, 0, 0, 0, 0)
                 user32.mouse_event(0x0004, 0, 0, 0, 0)
+            _raise_if_login_cancelled(cancel_event)
             _paste()
-            time.sleep(0.6)
+            if _wait_or_cancel(cancel_event, 0.6):
+                _raise_if_login_cancelled(cancel_event)
             _press(0x0D)                     # Enter
             for _ in range(8):
-                time.sleep(1.0)
+                if _wait_or_cancel(cancel_event, 1.0):
+                    _raise_if_login_cancelled(cancel_event)
                 if not user32.IsWindow(hwnd):
                     return '已自动填入密码并提交'
         return '已填入密码，但 Steam 还停在登录窗口（可能需要 Steam Guard 验证码）'

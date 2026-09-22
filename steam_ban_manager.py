@@ -33,7 +33,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.1.7"
+APP_VERSION = "3.1.8"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
@@ -690,6 +690,7 @@ def merge_legacy_user_data(legacy_directory: Path, data_directory: Path) -> dict
                 else:
                     values['password_enc'] = encrypted_password
 
+                source_has_real_id = bool(STEAM_ID_PATTERN.fullmatch(steam_id))
                 current = destination.execute(
                     'SELECT * FROM accounts WHERE steam_id=?', (steam_id,)
                 ).fetchone()
@@ -698,13 +699,25 @@ def merge_legacy_user_data(legacy_directory: Path, data_directory: Path) -> dict
                         'SELECT * FROM accounts WHERE account_name=? COLLATE NOCASE ORDER BY id',
                         (values['account_name'],),
                     ).fetchall()
-                    current = next(
-                        (row for row in same_name if not STEAM_ID_PATTERN.fullmatch(row['steam_id'] or '')),
-                        None,
-                    )
+                    if source_has_real_id:
+                        # 旧库拿到了真实 ID、当前库仍是同名占位行：直接原地升级占位行。
+                        current = next(
+                            (row for row in same_name if not STEAM_ID_PATTERN.fullmatch(row['steam_id'] or '')),
+                            None,
+                        )
+                    else:
+                        # 反向场景同样常见：当前库已经通过查询拿到真实 ID，但旧库仍是同名
+                        # 占位行且保存着密码。此时必须合并到真实 ID 行，而不是插入第二条占位行。
+                        current = next(
+                            (row for row in same_name if STEAM_ID_PATTERN.fullmatch(row['steam_id'] or '')),
+                            None,
+                        )
+                        if current is None:
+                            current = next(iter(same_name), None)
                     if current is not None:
-                        destination.execute('UPDATE accounts SET steam_id=? WHERE id=?', (steam_id, current['id']))
-                        current = destination.execute('SELECT * FROM accounts WHERE id=?', (current['id'],)).fetchone()
+                        if source_has_real_id:
+                            destination.execute('UPDATE accounts SET steam_id=? WHERE id=?', (steam_id, current['id']))
+                            current = destination.execute('SELECT * FROM accounts WHERE id=?', (current['id'],)).fetchone()
 
                 if current is None:
                     insert = {
@@ -1045,10 +1058,13 @@ def detect_csv_format(path: Path) -> tuple[str, str]:
         raise ValueError('导入文件为空。')
     encoding = ''
     sample = None
-    # 64 KiB 的样本可能正好切在多字节字符中间（UTF-8 的中文是 3 字节）。先按原样严格解码，
-    # 全部失败再依次退掉 1~3 个字节重试；这样既不会误判编码，也不会因为截断拒绝合法的大文件。
-    for data in (sample_bytes, sample_bytes[:-1], sample_bytes[:-2], sample_bytes[:-3]):
-        for candidate in ('utf-8-sig', 'gb18030', 'utf-8'):
+    # 64 KiB 的样本可能正好切在多字节字符中间（UTF-8 的中文是 3 字节）。必须先把
+    # UTF-8 的原样及去尾 1~3 字节变体全部尝试完，再尝试 GB18030：例如 UTF-8 被截成
+    # ``\xe4\xb8`` 时，这两个字节在 GB18030 中也是合法字符；交错尝试会把 UTF-8 文件误判为
+    # GB18030，导致后续整份文件的中文乱码。
+    sample_variants = (sample_bytes, sample_bytes[:-1], sample_bytes[:-2], sample_bytes[:-3])
+    for candidate in ('utf-8-sig', 'utf-8', 'gb18030'):
+        for data in sample_variants:
             try:
                 sample = data.decode(candidate)
             except UnicodeDecodeError:
@@ -2438,7 +2454,7 @@ class AccountDialog:
         frame.grid(sticky='nsew')
         ttk.Label(frame, text='账号标签（可选）').grid(row=0, column=0, sticky='w', pady=(0, 7))
         ttk.Entry(frame, textvariable=self.name_var, width=42).grid(row=0, column=1, sticky='ew', pady=(0, 7))
-        ttk.Label(frame, text='SteamID64 *').grid(row=1, column=0, sticky='w', pady=7)
+        ttk.Label(frame, text='SteamID64（可选）').grid(row=1, column=0, sticky='w', pady=7)
         steam_entry = ttk.Entry(frame, textvariable=self.steam_var, width=42)
         steam_entry.grid(row=1, column=1, sticky='ew', pady=7)
         ttk.Label(frame, text='备注（可选）').grid(row=2, column=0, sticky='w', pady=7)
@@ -2691,6 +2707,7 @@ class SteamBanApp:
         self.query_running = False
         self.import_running = False
         self.login_running = False
+        self.login_cancel_event = None
         self.update_check_running = False
         self.update_url = ''
         self.update_version = ''
@@ -2841,6 +2858,14 @@ class SteamBanApp:
             width=UiMetrics.KEY_LOGIN_BUTTON_WIDTH,
         )
         self.steam_login_button.pack(side="left", padx=(UiMetrics.KEY_ACTION_GAP, 0))
+        self.cancel_login_button = ttk.Button(
+            key_actions,
+            text="取消登录",
+            command=self.cancel_steam_login,
+            bootstyle="warning-outline",
+            state="disabled",
+        )
+        self.cancel_login_button.pack(side="left", padx=(UiMetrics.KEY_ACTION_GAP, 0))
         key_options = ttk.Frame(key_card, style="Card.TFrame")
         key_options.pack(fill="x", pady=(9, 0))
         self.remember_key_button = ttk.Checkbutton(
@@ -3132,19 +3157,34 @@ class SteamBanApp:
             return
         previous_account_id = self.store.active_account_id()
         self.login_running = True
+        self.login_cancel_event = threading.Event()
         self._set_controls(False)
+        self.cancel_login_button.configure(state="normal")
         self.status_var.set(f"正在退出当前 Steam 并登录账号 {account_name}，请稍候…")
         try:
             threading.Thread(
                 target=self._steam_login_worker,
-                args=(steam_exe, account_name, account.steam_id, password, account.account_id, previous_account_id),
+                args=(
+                    steam_exe, account_name, account.steam_id, password, account.account_id,
+                    previous_account_id, self.login_cancel_event,
+                ),
                 daemon=True,
             ).start()
         except RuntimeError as exc:
             self.login_running = False
+            self.login_cancel_event = None
             self._set_controls(True)
+            self.cancel_login_button.configure(state="disabled")
             self.status_var.set("无法启动自动登录。")
             messagebox.showerror(APP_NAME, f"无法启动自动登录线程：{exc}", parent=self.root)
+
+    def cancel_steam_login(self) -> None:
+        """请求取消尚在等待登录窗口或填密的自动登录。"""
+        if not self.login_running or self.login_cancel_event is None:
+            return
+        self.login_cancel_event.set()
+        self.cancel_login_button.configure(state="disabled")
+        self.status_var.set("正在取消自动登录；当前 Steam 操作结束后会恢复界面。")
 
     def _steam_login_worker(
         self,
@@ -3154,11 +3194,15 @@ class SteamBanApp:
         password: str,
         account_id: int | None = None,
         previous_account_id: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """后台线程：结束当前 Steam，写入自动登录配置，再带账号密码启动客户端。"""
         try:
             if not steam_login.shutdown_steam(steam_exe):
                 self.events.put(("steam_login_failed", "无法结束当前 Steam 进程，请手动退出 Steam 后重试。"))
+                return
+            if cancel_event is not None and cancel_event.is_set():
+                self.events.put(("steam_login_cancelled", None))
                 return
             if previous_account_id is not None:
                 # 仅在 Steam 已确实退出后记时；主线程收到事件后写库，避免跨线程共用 SQLite 连接。
@@ -3175,8 +3219,14 @@ class SteamBanApp:
                 # 账号+密码导入时会先用账号名占位。不能把占位符写进 loginusers.vdf，
                 # 也不能传给依赖 32 位账号 ID 的 Steam 设置逻辑。
                 tweaks = ['尚未解析 SteamID64，已跳过 Steam 配置写入']
+            if cancel_event is not None and cancel_event.is_set():
+                self.events.put(("steam_login_cancelled", None))
+                return
             steam_login.launch_login(steam_exe, account_name)
-            login_result = steam_login.automate_steam_login(password, steam_exe)
+            login_result = steam_login.automate_steam_login(password, steam_exe, cancel_event=cancel_event)
+        except steam_login.LoginAutomationCancelled:
+            self.events.put(("steam_login_cancelled", None))
+            return
         except (OSError, RuntimeError, KeyStorageError, ValueError) as exc:
             self.events.put(("steam_login_failed", str(exc)))
             return
@@ -3988,6 +4038,8 @@ class SteamBanApp:
                 elif kind == "steam_login_done":
                     account_id, logged_in_at, message = payload
                     self.login_running = False
+                    self.login_cancel_event = None
+                    self.cancel_login_button.configure(state="disabled")
                     if account_id is not None:
                         self.store.mark_account_logged_in(account_id, logged_in_at)
                     self._set_controls(not (self.query_running or self.import_running))
@@ -3995,9 +4047,17 @@ class SteamBanApp:
                     changed = True
                 elif kind == "steam_login_failed":
                     self.login_running = False
+                    self.login_cancel_event = None
+                    self.cancel_login_button.configure(state="disabled")
                     self._set_controls(not (self.query_running or self.import_running))
                     self.status_var.set("自动登录未完成。")
                     messagebox.showerror(APP_NAME, f"自动登录失败：{payload}", parent=self.root)
+                elif kind == "steam_login_cancelled":
+                    self.login_running = False
+                    self.login_cancel_event = None
+                    self.cancel_login_button.configure(state="disabled")
+                    self._set_controls(not (self.query_running or self.import_running))
+                    self.status_var.set("已取消自动登录；Steam 若已启动，可自行在客户端继续操作。")
         except queue.Empty:
             pass
         if changed:
@@ -4008,6 +4068,8 @@ class SteamBanApp:
         self.api_key_var.set("")
         if self.import_cancel_event is not None:
             self.import_cancel_event.set()
+        if self.login_cancel_event is not None:
+            self.login_cancel_event.set()
         self.store.close()
         self.root.destroy()
 
@@ -4020,7 +4082,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v3.1.7") == (3, 1, 7)
+    assert version_key("v3.1.8") == (3, 1, 8)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -4118,6 +4180,7 @@ def run_self_test() -> None:
             "SELECT id FROM accounts WHERE account_name='占位账号'"
         ).fetchone()['id']
         current_only_id = merge_current.upsert_account('当前独有', '76561198000000042', '不能丢失')
+        merge_current.upsert_account('反向占位账号', '76561198000000045', '已解析但没有密码')
         merge_current.close()
         merge_legacy = AccountStore(merge_legacy_dir / ACCOUNT_DATABASE_FILENAME)
         legacy_same_id = merge_legacy.upsert_account('同一账号', '76561198000000041', '旧备注', 'legacy-password')
@@ -4127,10 +4190,18 @@ def run_self_test() -> None:
         })
         merge_legacy.upsert_account('占位账号', '76561198000000043', '旧占位备注', 'placeholder-password')
         merge_legacy.upsert_account('旧库独有', '76561198000000044', '旧库备注', 'old-only-password')
+        merge_legacy.connection.execute(
+            AccountStore.UPSERT_SQL,
+            (
+                '反向占位账号', placeholder_for('反向占位账号'), '旧库有密码',
+                merge_legacy._encrypt_password('reverse-password'),
+            ),
+        )
+        merge_legacy.connection.commit()
         merge_legacy.close()
         merge_result = merge_legacy_user_data(merge_legacy_dir, merge_current_dir)
         assert merge_result['accounts_added'] == 1, merge_result
-        assert merge_result['passwords_filled'] == 3, merge_result
+        assert merge_result['passwords_filled'] == 4, merge_result
         merged_store = AccountStore(merge_current_dir / ACCOUNT_DATABASE_FILENAME)
         merged_same = merged_store.connection.execute(
             "SELECT * FROM accounts WHERE steam_id='76561198000000041'"
@@ -4143,6 +4214,12 @@ def run_self_test() -> None:
         assert merged_placeholder['steam_id'] == '76561198000000043'
         assert merged_placeholder['note'] == '当前占位备注'
         assert merged_store.account_password(int(merged_placeholder['id'])) == 'placeholder-password'
+        reverse_rows = merged_store.connection.execute(
+            "SELECT * FROM accounts WHERE account_name='反向占位账号'"
+        ).fetchall()
+        assert len(reverse_rows) == 1
+        assert reverse_rows[0]['steam_id'] == '76561198000000045'
+        assert merged_store.account_password(int(reverse_rows[0]['id'])) == 'reverse-password'
         assert merged_store.connection.execute('SELECT note FROM accounts WHERE id=?', (current_only_id,)).fetchone()['note'] == '不能丢失'
         assert merged_store.account_password(
             int(merged_store.connection.execute("SELECT id FROM accounts WHERE steam_id='76561198000000044'").fetchone()['id'])
@@ -4205,7 +4282,9 @@ def run_self_test() -> None:
         truncated_csv = root / "truncated.csv"
         with truncated_csv.open("wb") as handle:
             handle.write(b"account,password\n")
-            handle.write(b"a" * (65536 - len(b"account,password\n") - 1))
+            # 让样本最后正好是 UTF-8 中文“中”的前两个字节 e4 b8；它们恰好也是合法
+            # GB18030 字符，专门覆盖“先修剪 UTF-8，再试 GB18030”的优先级要求。
+            handle.write(b"a" * (65536 - len(b"account,password\n") - 2))
             handle.write("中,pw\n".encode("utf-8"))
             handle.write(b"tail,pw\n")
         assert detect_csv_format(truncated_csv)[0] == "utf-8-sig"
@@ -4224,6 +4303,13 @@ def run_self_test() -> None:
         assert steam_login._is_expected_steam_process_image(
             r'C:\Program Files (x86)\Steam\steamwebhelper.exe', expected_steam_exe
         ) is True
+        # 现代 Steam 的登录页由 CEF 子目录中的 steamwebhelper.exe 承载，仍属于同一安装目录。
+        assert steam_login._is_expected_steam_process_image(
+            r'C:\Program Files (x86)\Steam\bin\cef\cef.win64\steamwebhelper.exe', expected_steam_exe
+        ) is True
+        assert steam_login._is_expected_steam_process_image(
+            r'C:\Program Files (x86)\Steam-old\bin\cef\steamwebhelper.exe', expected_steam_exe
+        ) is False
         # 浏览器页面标题里即使有 Steam，也不会通过进程路径这道门。
         assert steam_login._is_expected_steam_process_image(
             r'C:\Program Files\Google\Chrome\Application\chrome.exe', expected_steam_exe
@@ -4231,6 +4317,14 @@ def run_self_test() -> None:
         # 启动 Steam 的命令行里不能再出现密码。
         import inspect as _inspect
         assert 'password' not in str(_inspect.signature(steam_login.launch_login))
+        assert hasattr(steam_login.wintypes, 'DWORD')
+        cancelled_login = threading.Event()
+        cancelled_login.set()
+        try:
+            steam_login.automate_steam_login('unused', expected_steam_exe, timeout=0.1, cancel_event=cancelled_login)
+            raise AssertionError('已取消的登录等待不应继续执行')
+        except steam_login.LoginAutomationCancelled:
+            pass
         # 主接口网络失败 + 备用主机 403 时，不能报成“Key 被撤销”。
         saved_urlopen = globals()['urlopen']
 
@@ -4746,7 +4840,7 @@ def run_self_test() -> None:
             steam_login.write_auto_login = lambda *_args: login_calls.append("write_auto_login")
             steam_login.apply_login_tweaks = lambda *_args: login_calls.append("tweaks") or []
             steam_login.launch_login = lambda *_args: login_calls.append("launch")
-            steam_login.automate_steam_login = lambda _password, _steam_exe: login_calls.append("automate") or "已提交"
+            steam_login.automate_steam_login = lambda _password, _steam_exe, **_kwargs: login_calls.append("automate") or "已提交"
             login_app._steam_login_worker("steam.exe", "placeholder-user", "placeholder-user", "password")
         finally:
             steam_login.shutdown_steam = saved_shutdown
