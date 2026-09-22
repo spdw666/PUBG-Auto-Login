@@ -34,7 +34,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "4.1.1"
+APP_VERSION = "4.1.2"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
@@ -1156,12 +1156,13 @@ def import_record(row: list[str], layout: CsvLayout) -> tuple[str, str, str, str
 
 class AccountStore:
     UPSERT_SQL = """
-        INSERT INTO accounts (account_name, steam_id, note, password)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO accounts (account_name, steam_id, note, password, imported_at)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(steam_id) DO UPDATE SET
             account_name=COALESCE(NULLIF(excluded.account_name, ''), accounts.account_name),
             note=COALESCE(NULLIF(excluded.note, ''), accounts.note),
-            password=COALESCE(NULLIF(excluded.password, ''), accounts.password)
+            password=COALESCE(NULLIF(excluded.password, ''), accounts.password),
+            imported_at=excluded.imported_at
     """
 
     def __init__(self, db_path: Path):
@@ -1199,6 +1200,7 @@ class AccountStore:
                 status TEXT NOT NULL DEFAULT '未查询',
                 query_error TEXT NOT NULL DEFAULT '',
                 password TEXT NOT NULL DEFAULT '',
+                imported_at TEXT,
                 last_login_at TEXT,
                 last_logout_at TEXT
             );
@@ -1212,6 +1214,8 @@ class AccountStore:
         existing = {row[1] for row in connection.execute('PRAGMA table_info(accounts)')}
         if 'password' not in existing:
             connection.execute("ALTER TABLE accounts ADD COLUMN password TEXT NOT NULL DEFAULT ''")
+        if 'imported_at' not in existing:
+            connection.execute("ALTER TABLE accounts ADD COLUMN imported_at TEXT")
         if 'last_login_at' not in existing:
             connection.execute("ALTER TABLE accounts ADD COLUMN last_login_at TEXT")
         if 'last_logout_at' not in existing:
@@ -1293,8 +1297,10 @@ class AccountStore:
         total = int(self.connection.execute(f'SELECT COUNT(*) FROM accounts {where}').fetchone()[0])
         rows = self.connection.execute(
             f'SELECT * FROM accounts {where}'
-            ' ORDER BY CASE WHEN last_login_at IS NULL OR last_login_at = \'\' THEN 1 ELSE 0 END,'
-            ' last_login_at DESC, account_name COLLATE NOCASE, steam_id LIMIT ? OFFSET ?',
+            # 最近一次“动过”（导入或登录）的排在最上面：刚导入的账号立刻出现在顶部，
+            # 登录过的账号也会因为登录时间更新而冒到前面。没有时间的一律按导入顺序（id 新的在前）。
+            " ORDER BY COALESCE(NULLIF(last_login_at, ''), NULLIF(imported_at, ''), '') DESC,"
+            ' id DESC, account_name COLLATE NOCASE, steam_id LIMIT ? OFFSET ?',
             (limit, offset),
         ).fetchall()
         return rows, total
@@ -1464,7 +1470,9 @@ class AccountStore:
                         )
                         stats['imported'] += 1
                         continue
-                connection.execute(AccountStore.UPSERT_SQL, (account_name, steam_id, note, password))
+                connection.execute(
+                AccountStore.UPSERT_SQL, (account_name, steam_id, note, password, utc_now())
+            )
                 stats['imported'] += 1
 
     @staticmethod
@@ -1653,7 +1661,7 @@ class AccountStore:
         note = note.strip()
         password = password or ''
         if account_id is None:
-            self.connection.execute(self.UPSERT_SQL, (account_name, steam_id, note, password))
+            self.connection.execute(self.UPSERT_SQL, (account_name, steam_id, note, password, utc_now()))
             created_id = self.connection.execute(
                 'SELECT id FROM accounts WHERE steam_id=?',
                 (steam_id,),
@@ -4061,7 +4069,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v4.1.1") == (4, 1, 1)
+    assert version_key("v4.1.2") == (4, 1, 2)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -4152,7 +4160,7 @@ def run_self_test() -> None:
             'NumberOfGameBans': 0, 'CommunityBanned': False, 'EconomyBan': 'none',
         })
         merge_current.connection.execute(
-            AccountStore.UPSERT_SQL, ('占位账号', placeholder_for('占位账号'), '当前占位备注', '')
+            AccountStore.UPSERT_SQL, ('占位账号', placeholder_for('占位账号'), '当前占位备注', '', utc_now())
         )
         merge_current.connection.commit()
         placeholder_id = merge_current.connection.execute(
@@ -4173,7 +4181,7 @@ def run_self_test() -> None:
             AccountStore.UPSERT_SQL,
             (
                 '反向占位账号', placeholder_for('反向占位账号'), '旧库有密码',
-                'reverse-password',
+                'reverse-password', utc_now(),
             ),
         )
         merge_legacy.connection.commit()
@@ -4236,7 +4244,7 @@ def run_self_test() -> None:
         # 占位账号解析成功后合并：密码/备注/标签要并进真 ID 行，不能随占位行一起被删掉。
         upsert_store.connection.execute(
             AccountStore.UPSERT_SQL,
-            ("占位账号", placeholder_for("占位账号"), "占位备注", "secret"),
+            ("占位账号", placeholder_for("占位账号"), "占位备注", "secret", utc_now()),
         )
         upsert_store.connection.commit()
         placeholder_id = upsert_store.connection.execute(
