@@ -1104,51 +1104,17 @@ def automate_steam_login(
     if state == 'timeout':
         return f'{int(timeout)} 秒内没有等到 Steam 登录窗口，也没检测到 Steam 已登录：{describe_steam_startup(steam_exe)}'
     hwnd = value
-    # 先让命令行账号密码自己登录（实测 5~10 秒）。成功就返回，完全不模拟键盘鼠标。
+    # 先让命令行账号密码自己登录（实测 8~10 秒）。成功即返回，全程不模拟键盘鼠标。
     if wait_for_logged_on(steam_exe, LOGIN_COMMAND_GRACE, cancel_event, progress):
         return '已自动登录成功（命令行账号密码，全程没有模拟键盘鼠标）'
-    user32 = _user32()
-    if not _bring_to_foreground(hwnd):
-        return 'Steam 登录窗口没能切到前台，已跳过自动填密码；请手动点一下 Steam 窗口后重试'
-    if _wait_or_cancel(cancel_event, LOGIN_FORM_READY_DELAY):
-        _raise_if_login_cancelled(cancel_event)
-    if user32.GetForegroundWindow() != hwnd:
-        return 'Steam 登录窗口被其它窗口抢到前台，已跳过自动填密码'
-    # 实测：即使 Steam 此刻还显示 connecting（代理环境常见），提交密码后它会在连上
-    # 服务器的瞬间完成登录，所以这里不再等待连接，避免白等几十秒。
-    connection_note = ''
+    # 命令行没成功就只有两种情况：需要 Steam Guard 验证码，或账号密码不对——
+    # 这两种情况程序都不该去猜、更不该模拟键盘鼠标往窗口里打字（那会把正确密码变成
+    # 错误尝试，甚至写进别的控件）。交给用户在官方窗口里处理。
     if steam_connection_state(steam_exe) == 'connecting':
-        connection_note = '（注意：Steam 当时仍在连接服务器；若未登录成功，请先解决代理/VPN）'
-    if not _set_clipboard(password):
-        return '剪贴板不可用，已跳过自动填密码'
-    try:
-        _raise_if_login_cancelled(cancel_event)
-        # 先把焦点确定地放进密码框，再粘贴一次、只提交一次。旧版靠“Tab/点击 + 反复粘贴”
-        # 兜底；纯盲贴会在焦点仍处于账号框时把密码填进账号框，Steam 便报“账号或密码错误”。
-        _click_password_field(hwnd)
-        if _wait_or_cancel(cancel_event, 0.4):
-            _raise_if_login_cancelled(cancel_event)
-        _paste()
-        if _wait_or_cancel(cancel_event, 0.6):
-            _raise_if_login_cancelled(cancel_event)
-        _press(_VK_RETURN)
-        submit_offset = connection_log_size(steam_exe)
-        submit_account = active_login_account_id()
-        deadline = time.time() + max(1.0, LOGIN_SUBMIT_RESULT_WAIT)
-        while time.time() < deadline:
-            if _wait_or_cancel(cancel_event, 1.0):
-                _raise_if_login_cancelled(cancel_event)
-            if logged_on_since(steam_exe, submit_offset):
-                return '密码提交成功，Steam 已登录' + connection_note
-            current = active_login_account_id()
-            if current and current != submit_account:
-                return '密码提交成功，Steam 已登录' + connection_note
-            if not user32.IsWindow(hwnd):
-                return '已自动填入密码并提交' + connection_note
-        return '已填入密码并提交一次；Steam 仍停在登录窗口，请按提示完成 Steam Guard 或手动继续' + connection_note
-    finally:
-        # 任一 Win32 调用异常、线程被上层捕获或登录窗口消失时都不能把密码留在剪贴板。
-        _clear_clipboard()
+        return ('命令行账号密码已提交，但 Steam 当时还没连上服务器（代理/VPN 常见），'
+                '也没有完成登录；请先解决网络后重试，或直接在 Steam 窗口里登录。')
+    return ('命令行账号密码已提交，Steam 仍停在登录窗口：可能需要 Steam Guard 验证码或密码不正确，'
+            '请在 Steam 窗口里完成验证（本程序不会模拟键盘鼠标）。')
 
 
 # ---------------------------------------------------------------------------
