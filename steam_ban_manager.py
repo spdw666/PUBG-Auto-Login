@@ -33,7 +33,7 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.1.5"
+APP_VERSION = "3.1.6"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
@@ -54,6 +54,9 @@ LEGACY_DRIVE_SKIP_DIRECTORY_NAMES = LEGACY_SCAN_SKIP_DIRECTORY_NAMES | {
     'windows', 'program files', 'program files (x86)', 'programdata', '$recycle.bin',
     'system volume information', 'recovery', 'perflogs', 'msocache', 'config.msi', 'appdata',
     'intel', 'amd', 'nvidia', 'drivers',
+    # 当前用户的目录由用户目录遍历负责；固定磁盘这一层跳过 Users，
+    # 免得把同一台电脑上**别的 Windows 用户**的账号库当成旧数据迁移过来（DPAPI 解不开，密码全废）。
+    'users',
 }
 LEGACY_DRIVE_SCAN_MAX_DEPTH = 2
 LEGACY_SCAN_MAX_DIRECTORIES = 40000
@@ -604,6 +607,21 @@ def migrate_legacy_user_data(
     return migrated_database, migrated_settings
 
 
+SQL_VARIABLE_CHUNK = 900
+
+
+def id_chunks(values: Iterable[int], size: int = SQL_VARIABLE_CHUNK) -> Iterator[list[int]]:
+    """把 id 列表切块，避免一次绑定上万个参数触发 SQLite 的变量数上限。"""
+    chunk: list[int] = []
+    for value in values:
+        chunk.append(int(value))
+        if len(chunk) >= max(1, size):
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
 
@@ -812,13 +830,21 @@ def detect_csv_format(path: Path) -> tuple[str, str]:
         sample_bytes = source.read(65536)
     if not sample_bytes:
         raise ValueError('导入文件为空。')
-    for encoding in ('utf-8-sig', 'gb18030', 'utf-8'):
-        try:
-            sample = sample_bytes.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-        break
-    else:
+    encoding = ''
+    sample = None
+    # 64 KiB 的样本可能正好切在多字节字符中间（UTF-8 的中文是 3 字节）。先按原样严格解码，
+    # 全部失败再依次退掉 1~3 个字节重试；这样既不会误判编码，也不会因为截断拒绝合法的大文件。
+    for data in (sample_bytes, sample_bytes[:-1], sample_bytes[:-2], sample_bytes[:-3]):
+        for candidate in ('utf-8-sig', 'gb18030', 'utf-8'):
+            try:
+                sample = data.decode(candidate)
+            except UnicodeDecodeError:
+                continue
+            encoding = candidate
+            break
+        if sample is not None:
+            break
+    if sample is None:
         raise ValueError('无法读取文件编码。请使用 UTF-8 或 GB18030 编码的 CSV/TSV。')
     try:
         delimiter = csv.Sniffer().sniff(sample, delimiters=',\t;').delimiter
@@ -887,8 +913,8 @@ class AccountStore:
         INSERT INTO accounts (account_name, steam_id, note, password_enc)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(steam_id) DO UPDATE SET
-            account_name=excluded.account_name,
-            note=excluded.note,
+            account_name=COALESCE(NULLIF(excluded.account_name, ''), accounts.account_name),
+            note=COALESCE(NULLIF(excluded.note, ''), accounts.note),
             password_enc=COALESCE(NULLIF(excluded.password_enc, ''), accounts.password_enc)
     """
 
@@ -1016,14 +1042,17 @@ class AccountStore:
         ids = [int(account_id) for account_id in account_ids]
         if not ids:
             return {}
-        placeholders = ', '.join('?' for _ in ids)
-        rows = self.connection.execute(
-            f'SELECT id, last_logout_at, last_login_at FROM accounts WHERE id IN ({placeholders})', ids
-        ).fetchall()
-        return {
-            int(row['id']): (row['last_logout_at'], row['last_login_at'])
-            for row in rows
-        }
+        timestamps: dict[int, tuple[str | None, str | None]] = {}
+        for chunk in id_chunks(ids):
+            placeholders = ', '.join('?' for _ in chunk)
+            rows = self.connection.execute(
+                f'SELECT id, last_logout_at, last_login_at FROM accounts WHERE id IN ({placeholders})', chunk
+            ).fetchall()
+            timestamps.update({
+                int(row['id']): (row['last_logout_at'], row['last_login_at'])
+                for row in rows
+            })
+        return timestamps
 
     def active_account_id(self) -> int | None:
         """返回上一次由本工具成功登录、且尚未在下一次切换中退出的账号。"""
@@ -1074,12 +1103,15 @@ class AccountStore:
         ids = [int(item) for item in account_ids]
         if not ids:
             return []
-        marks = ','.join('?' for _ in ids)
-        rows = self.connection.execute(
-            f'SELECT id, account_name, steam_id, note FROM accounts WHERE id IN ({marks}) ORDER BY id',
-            ids,
-        ).fetchall()
-        return [Account(row['id'], row['account_name'], row['steam_id'], row['note']) for row in rows]
+        accounts: list[Account] = []
+        for chunk in id_chunks(ids):
+            marks = ','.join('?' for _ in chunk)
+            rows = self.connection.execute(
+                f'SELECT id, account_name, steam_id, note FROM accounts WHERE id IN ({marks}) ORDER BY id',
+                chunk,
+            ).fetchall()
+            accounts.extend(Account(row['id'], row['account_name'], row['steam_id'], row['note']) for row in rows)
+        return accounts
 
     @staticmethod
     def account_batches(db_path: Path, account_ids: Iterable[int] | None = None) -> Iterator[list[Account]]:
@@ -1092,11 +1124,15 @@ class AccountStore:
                 ids = [int(item) for item in account_ids]
                 if not ids:
                     return
-                marks = ','.join('?' for _ in ids)
-                cursor = connection.execute(
-                    f'SELECT id, account_name, steam_id, note FROM accounts WHERE id IN ({marks}) ORDER BY id',
-                    ids,
-                )
+                for chunk in id_chunks(ids):
+                    marks = ','.join('?' for _ in chunk)
+                    cursor = connection.execute(
+                        f'SELECT id, account_name, steam_id, note FROM accounts WHERE id IN ({marks}) ORDER BY id',
+                        chunk,
+                    )
+                    while rows := cursor.fetchmany(CONSERVATIVE_BATCH_SIZE):
+                        yield [Account(row['id'], row['account_name'], row['steam_id'], row['note']) for row in rows]
+                return
             while rows := cursor.fetchmany(CONSERVATIVE_BATCH_SIZE):
                 yield [Account(row['id'], row['account_name'], row['steam_id'], row['note']) for row in rows]
         finally:
@@ -1386,9 +1422,30 @@ class AccountStore:
         如果这个 ID 已经被另一条记录占用，说明库里已经有同账号，直接删掉这条占位记录。
         """
         steam_id = normalize_steam_id(steam_id)
-        existing = self.connection.execute('SELECT id FROM accounts WHERE steam_id=?', (steam_id,)).fetchone()
+        existing = self.connection.execute(
+            'SELECT id, account_name, note, password_enc FROM accounts WHERE steam_id=?', (steam_id,)
+        ).fetchone()
         if existing is not None and int(existing['id']) != int(account_id):
             with self.connection:
+                # 占位行（只有账号+密码）解析成功后要并进真ID行：先把占位行比真ID行更全的字段补过去，
+                # 否则用户辛苦导入的密码、备注、账号标签会随着占位行一起被删掉。
+                placeholder = self.connection.execute(
+                    'SELECT account_name, note, password_enc FROM accounts WHERE id=?', (int(account_id),)
+                ).fetchone()
+                if placeholder is not None:
+                    self.connection.execute(
+                        "UPDATE accounts SET"
+                        " account_name=COALESCE(NULLIF(account_name, ''), ?),"
+                        " note=COALESCE(NULLIF(note, ''), ?),"
+                        " password_enc=COALESCE(NULLIF(password_enc, ''), ?)"
+                        " WHERE id=?",
+                        (
+                            placeholder['account_name'] or '',
+                            placeholder['note'] or '',
+                            placeholder['password_enc'] or '',
+                            int(existing['id']),
+                        ),
+                    )
                 self.connection.execute('DELETE FROM accounts WHERE id=?', (int(account_id),))
                 self.connection.execute(
                     "DELETE FROM app_state WHERE state_key='active_account_id' AND state_value=?",
@@ -1403,13 +1460,14 @@ class AccountStore:
         ids = [int(item) for item in account_ids]
         if not ids:
             return
-        marks = ','.join('?' for _ in ids)
         with self.connection:
-            self.connection.execute(f'DELETE FROM accounts WHERE id IN ({marks})', ids)
-            self.connection.execute(
-                f"DELETE FROM app_state WHERE state_key='active_account_id' AND state_value IN ({marks})",
-                [str(account_id) for account_id in ids],
-            )
+            for chunk in id_chunks(ids):
+                marks = ','.join('?' for _ in chunk)
+                self.connection.execute(f'DELETE FROM accounts WHERE id IN ({marks})', chunk)
+                self.connection.execute(
+                    f"DELETE FROM app_state WHERE state_key='active_account_id' AND state_value IN ({marks})",
+                    [str(account_id) for account_id in chunk],
+                )
 
     def clear_rejected_key_failures(self) -> int:
         """清理旧版把一次全局 401/403 误写到每一条账号上的状态。"""
@@ -1472,10 +1530,14 @@ class AccountStore:
             ids = [int(item) for item in account_ids]
             if not ids:
                 return
-            marks = ','.join('?' for _ in ids)
-            cursor = self.connection.execute(
-                f'{columns} WHERE id IN ({marks}) ORDER BY account_name COLLATE NOCASE, steam_id', ids
-            )
+            for chunk in id_chunks(ids):
+                marks = ','.join('?' for _ in chunk)
+                cursor = self.connection.execute(
+                    f'{columns} WHERE id IN ({marks}) ORDER BY account_name COLLATE NOCASE, steam_id', chunk
+                )
+                for row in cursor:
+                    yield (row['account_name'], row['steam_id'], row['note'], self._decrypt_password(row['password_enc']))
+            return
         for row in cursor:
             yield (row['account_name'], row['steam_id'], row['note'], self._decrypt_password(row['password_enc']))
 
@@ -1521,9 +1583,18 @@ def request_player_bans(api_key: str, steam_ids: list[str]) -> dict[str, dict[st
         if not isinstance(players, list):
             raise SteamApiFatalError('Steam API 响应中未找到 players 列表')
         return {str(player.get('SteamId')): player for player in players if player.get('SteamId')}
-    if rejected_statuses:
-        codes = ', '.join(str(code) for code in sorted(set(rejected_statuses)))
+    codes = ', '.join(str(code) for code in sorted(set(rejected_statuses)))
+    if rejected_statuses and len(rejected_statuses) >= len(API_URLS):
+        # 只有每个主机都明确拒绝，才能断定是 Key 失效。
         raise SteamApiFatalError('Steam 的两个兼容 API 主机都拒绝了当前 Web API Key（HTTP %s）。请在 Steam 的 API Key 页面确认该 Key 未被撤销，重新生成后完整复制粘贴，再重新查询。' % codes)
+    if rejected_statuses:
+        # 常见情况：主接口网络失败，备用主机（合作伙伴专用）对普通 Key 返回 403。
+        # 这不能说明 Key 失效，否则会误导用户去注销重绑。
+        detail = connection_errors[-1] if connection_errors else '未知网络错误'
+        raise SteamApiFatalError(
+            f'Steam API 连接失败：{detail}。本次没有收到主接口的有效响应'
+            f'（备用主机返回 HTTP {codes}，对普通 Key 属正常现象，不代表 Key 失效），请检查网络后重试。'
+        )
     detail = connection_errors[-1] if connection_errors else '未知网络错误'
     raise SteamApiFatalError(f'无法连接 Steam API: {detail}')
 
@@ -2143,6 +2214,7 @@ class AccountDialog:
         self.window.transient(parent)
         self.window.resizable(False, False)
         self.result = None
+        self.initial = initial
 
         self.name_var = StringVar(value=initial.account_name if initial else '')
         self.steam_var = StringVar(value=initial.steam_id if initial else '')
@@ -2176,12 +2248,32 @@ class AccountDialog:
         self.window.grab_set()
 
     def _save(self) -> None:
-        try:
-            steam_id = normalize_steam_id(self.steam_var.get())
-        except ValueError as exc:
-            messagebox.showerror(APP_NAME, str(exc), parent=self.window)
+        account_name = self.name_var.get().strip()
+        raw_steam_id = self.steam_var.get().strip()
+        original_steam_id = (self.initial.steam_id if self.initial else '') or ''
+        original_is_placeholder = not STEAM_ID_PATTERN.fullmatch(original_steam_id)
+        if STEAM_ID_PATTERN.fullmatch(raw_steam_id):
+            steam_id = raw_steam_id
+        elif raw_steam_id == '' and not original_is_placeholder:
+            # 清空输入框不应把已经解析好的账号打回“未解析”。
+            steam_id = original_steam_id
+        elif raw_steam_id == '' or (original_is_placeholder and raw_steam_id == original_steam_id):
+            # 留空、或仍是"尚未解析"的占位：保留占位，等查询时自动解析出真实 SteamID64。
+            # 这样用户才能给这类账号补密码 / 改标签 / 改备注。
+            steam_id = placeholder_for(account_name) if account_name else original_steam_id
+            if not steam_id:
+                messagebox.showerror(
+                    APP_NAME, '请填写账号标签（用于自动解析 SteamID64）或直接填写 17 位 SteamID64。',
+                    parent=self.window,
+                )
+                return
+        else:
+            messagebox.showerror(
+                APP_NAME, 'SteamID64 必须是 17 位数字；留空则会在查询时按账号标签自动解析。',
+                parent=self.window,
+            )
             return
-        self.result = (self.name_var.get().strip(), steam_id, self.note_var.get().strip(), self.password_var.get())
+        self.result = (account_name, steam_id, self.note_var.get().strip(), self.password_var.get())
         self.window.destroy()
 
 
@@ -2863,12 +2955,16 @@ class SteamBanApp:
             tweaks = []
             if STEAM_ID_PATTERN.fullmatch(steam_id):
                 steam_login.write_auto_login(steam_exe, steam_id, account_name)
-                tweaks = steam_login.apply_login_tweaks(steam_exe, steam_id)
+                try:
+                    tweaks = steam_login.apply_login_tweaks(steam_exe, steam_id)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    # 改写 Steam 客户端设置失败（例如配置文件编码异常）不应该阻止本次登录。
+                    tweaks = [f'Steam 设置未写入（{exc}）']
             else:
                 # 账号+密码导入时会先用账号名占位。不能把占位符写进 loginusers.vdf，
                 # 也不能传给依赖 32 位账号 ID 的 Steam 设置逻辑。
                 tweaks = ['尚未解析 SteamID64，已跳过 Steam 配置写入']
-            steam_login.launch_login(steam_exe, account_name, password)
+            steam_login.launch_login(steam_exe, account_name)
             login_result = steam_login.automate_steam_login(password)
         except (OSError, RuntimeError, KeyStorageError, ValueError) as exc:
             self.events.put(("steam_login_failed", str(exc)))
@@ -3611,8 +3707,10 @@ class SteamBanApp:
                     self.legacy_scan_running = False
                     self._should_scan_legacy_profile = False
                     if payload:
-                        handled = self._automatically_migrate_legacy_database(Path(payload))
-                        if handled or self.store.count_accounts():
+                        # 只有确实处理完（继承成功，或当前库更完整无需替换）才记“已查过”。
+                        # 正在跑任务、或继承失败时不能记，否则下次启动不再查找，
+                        # “重新打开程序即可继承”就永远无法兑现。
+                        if self._automatically_migrate_legacy_database(Path(payload)):
                             self._mark_legacy_profile_scan_complete()
                     else:
                         self._mark_legacy_profile_scan_complete()
@@ -3735,7 +3833,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v3.1.5") == (3, 1, 5)
+    assert version_key("v3.1.6") == (3, 1, 6)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -3825,6 +3923,78 @@ def run_self_test() -> None:
         finally:
             globals()['collect_legacy_account_databases'] = saved_collector
         assert scan_app.events.get_nowait() == ('legacy_data_found', str(deep_legacy_directory / ACCOUNT_DATABASE_FILENAME))
+
+        # 只带 SteamID64 的增量导入不能清空已有的账号名/备注，已保存密码也要留着。
+        upsert_store = AccountStore(root / "upsert.sqlite3")
+        kept_id = upsert_store.upsert_account("保留账号名", "76561198000000004", "保留备注", password="pw")
+        upsert_store.upsert_account("", "76561198000000004", "")
+        kept_row = upsert_store.connection.execute(
+            "SELECT account_name, note FROM accounts WHERE id=?", (kept_id,)
+        ).fetchone()
+        assert kept_row["account_name"] == "保留账号名" and kept_row["note"] == "保留备注"
+        assert upsert_store.account_password(kept_id) == "pw"
+        # 占位账号解析成功后合并：密码/备注/标签要并进真 ID 行，不能随占位行一起被删掉。
+        upsert_store.connection.execute(
+            AccountStore.UPSERT_SQL,
+            ("占位账号", placeholder_for("占位账号"), "占位备注", upsert_store._encrypt_password("secret")),
+        )
+        upsert_store.connection.commit()
+        placeholder_id = upsert_store.connection.execute(
+            "SELECT id FROM accounts WHERE account_name='占位账号'"
+        ).fetchone()["id"]
+        real_id = upsert_store.upsert_account("", "76561198000000003", "")
+        assert upsert_store.update_steam_id(placeholder_id, "76561198000000003") is False
+        assert upsert_store.account_password(real_id) == "secret"
+        assert upsert_store.count_accounts() == 2
+        upsert_store.close()
+
+        # 一次性处理上万个 id 不能撞 SQLite 变量上限（删除 / 导出 / 登录计时都要分块）。
+        chunk_store = AccountStore(root / "chunk.sqlite3")
+        chunk_store.delete_accounts(range(40000))
+        assert chunk_store.login_timestamps(range(40000)) == {}
+        assert list(chunk_store.export_account_rows(range(40000))) == []
+        assert chunk_store.account_objects(range(40000)) == []
+        assert list(AccountStore.account_batches(chunk_store.db_path, range(40000))) == []
+        chunk_store.close()
+
+        # 64 KiB 样本正好切在多字节字符中间时，仍然要识别出真实编码（不能误判成 GB18030）。
+        truncated_csv = root / "truncated.csv"
+        with truncated_csv.open("wb") as handle:
+            handle.write(b"account,password\n")
+            handle.write(b"a" * (65536 - len(b"account,password\n") - 1))
+            handle.write("中,pw\n".encode("utf-8"))
+            handle.write(b"tail,pw\n")
+        assert detect_csv_format(truncated_csv)[0] == "utf-8-sig"
+
+        # loginusers.vdf 用空格缩进（别的工具改过）也要能解析，否则登录会放弃写入。
+        spaced_vdf = '"users"\n{\n    "76561198000000001"\n    {\n        "AccountName"        "spaced"\n    }\n}\n'
+        assert set(steam_login.parse_loginusers(spaced_vdf)) == {"76561198000000001"}
+        # 韩/日/俄/德等本地化标题也要能认出登录窗口；更新/安装窗口不能误认。
+        assert steam_login._is_login_window_title('Steam 로그인') is True
+        assert steam_login._is_login_window_title('Вход в Steam') is True
+        assert steam_login._is_login_window_title('Sign in to Steam') is True
+        assert steam_login._is_login_window_title('Steam 更新') is False
+        assert steam_login._is_login_window_title('记事本') is False
+        # 启动 Steam 的命令行里不能再出现密码。
+        import inspect as _inspect
+        assert 'password' not in str(_inspect.signature(steam_login.launch_login))
+        # 主接口网络失败 + 备用主机 403 时，不能报成“Key 被撤销”。
+        saved_urlopen = globals()['urlopen']
+
+        def failing_urlopen(request, timeout=0):
+            if 'partner' in request.full_url:
+                raise HTTPError(request.full_url, 403, 'Forbidden', None, None)
+            raise URLError('timed out')
+
+        try:
+            globals()['urlopen'] = failing_urlopen
+            try:
+                request_player_bans('placeholder-key', ['76561198000000000'])
+                raise AssertionError('网络失败时不应该返回结果')
+            except SteamApiFatalError as exc:
+                assert '连接失败' in str(exc) and '未撤销' not in str(exc), str(exc)
+        finally:
+            globals()['urlopen'] = saved_urlopen
 
         store = AccountStore(root / "test.sqlite3")
         account_id = store.upsert_account("测试账号", "76561198000000000", "仅测试")

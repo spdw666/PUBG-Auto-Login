@@ -22,7 +22,8 @@ from urllib.request import Request, urlopen
 VDF_ACCOUNT_FIELDS = ("AccountName", "PersonaName", "RememberPassword", "WantsOfflineMode",
                       "SkipOfflineModeWarning", "AutoLogin", "Timestamp")
 
-_ENTRY_RE = re.compile(r'"(\d{17})"\s*\{(.*?)\n\t\}', re.S)
+# 闭合括号前的缩进不一定是制表符：Steam 自己写的是 \n\t}，其它工具可能写成空格或不缩进。
+_ENTRY_RE = re.compile(r'"(\d{17})"\s*\{(.*?)\r?\n[ \t]*\}', re.S)
 _KV_RE = re.compile(r'"([^"]+)"\s*"([^"]*)"')
 _EMPTY_USERS = '"users"\n{\n}\n'
 
@@ -108,7 +109,7 @@ def write_auto_login(steam_exe: str, steam_id: str, account_name: str) -> Path:
     path = loginusers_path(steam_exe)
     raw = path.read_bytes() if path.is_file() else b""
     bom = raw.startswith(b"\xef\xbb\xbf")
-    text = raw.decode("utf-8-sig", errors="ignore") if raw else _EMPTY_USERS
+    text = raw.decode("utf-8-sig", errors="surrogateescape") if raw else _EMPTY_USERS
     users = parse_loginusers(text)
     if not users and text.strip() not in ("", _EMPTY_USERS.strip()):
         raise RuntimeError("无法解析 loginusers.vdf，已放弃写入以避免丢失账号列表")
@@ -116,7 +117,7 @@ def write_auto_login(steam_exe: str, steam_id: str, account_name: str) -> Path:
         path.with_suffix(".vdf.bak").write_bytes(raw)
     set_auto_login(users, steam_id, account_name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_loginusers(users, bom=bom), encoding="utf-8")
+    path.write_bytes(render_loginusers(users, bom=bom).encode("utf-8", errors="surrogateescape"))
     try:
         import winreg
 
@@ -166,12 +167,13 @@ def shutdown_steam(steam_exe: str, timeout: float = 40.0) -> bool:
     return not steam_running()
 
 
-def launch_login(steam_exe: str, account: str, password: str) -> subprocess.Popen:
-    """用命令行登录参数启动 Steam（账号密码自动填入，无需手输）。
+def launch_login(steam_exe: str, account: str) -> subprocess.Popen:
+    """用命令行参数启动 Steam 并预填账号名，密码由 automate_steam_login 注入登录窗口。
 
-    带上 -noreactlogin：强制走旧版登录框，账号密码参数才会被直接采用。
+    这里刻意不带密码：现代 Steam 客户端已经不读命令行里的密码，带上只会让密码明文出现在
+    任务管理器 / WMI 的进程命令行里。带上 -noreactlogin 是为了让旧版登录框出现。
     """
-    return subprocess.Popen([steam_exe, "-noreactlogin", "-login", account, password],
+    return subprocess.Popen([steam_exe, "-noreactlogin", "-login", account],
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 # ---------------------------------------------------------------------------
@@ -312,7 +314,9 @@ def _patch_vdf_many(path: Path, edits: list, backup_dir: Path) -> bool:
         return False
     raw = path.read_bytes()
     bom = raw.startswith(b'\xef\xbb\xbf')
-    text = raw.decode('utf-8-sig')
+    # Steam 的配置文件里可能残留 ANSI/GBK 字节（老游戏、云存档）。用 surrogateescape 原样保留，
+    # 既不会抛 UnicodeDecodeError 中断登录，也不会在写回时把原有字节改成问号。
+    text = raw.decode('utf-8-sig', errors='surrogateescape')
     changed = False
     for keys, value in edits:
         text, one = _set_vdf_path(text, keys, value)
@@ -325,7 +329,7 @@ def _patch_vdf_many(path: Path, edits: list, backup_dir: Path) -> bool:
             (backup_dir / path.name).write_bytes(raw)
     except OSError:
         pass
-    path.write_bytes((b'\xef\xbb\xbf' if bom else b'') + text.encode('utf-8'))
+    path.write_bytes((b'\xef\xbb\xbf' if bom else b'') + text.encode('utf-8', errors='surrogateescape'))
     return True
 
 
@@ -459,12 +463,31 @@ def _sync_remotecache(account_dir: Path, backup_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 LOGIN_WINDOW_TITLES = ('登录 Steam', 'Sign in to Steam', 'Steam 登录', '登入 Steam', 'Steam 登入')
+# 客户端启动早期的窗口标题里也带 Steam，别把密码打进这些窗口。
+LOGIN_WINDOW_TITLE_EXCLUDES = ('更新', 'updat', 'bootstrapper', 'install', 'waiting')
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 
 
 def _user32():
     return ctypes.windll.user32
+
+
+def _is_login_window_title(title: str) -> bool:
+    """判断窗口标题是不是 Steam 的登录窗口。
+
+    先精确匹配常见语言，再退化为"标题里带 Steam"——韩/日/俄/德等客户端只有本地化标题，
+    精确列表覆盖不全，但它们的标题里都含 Steam。
+    """
+    text = (title or '').strip()
+    if not text:
+        return False
+    if text in LOGIN_WINDOW_TITLES:
+        return True
+    lowered = text.casefold()
+    if 'steam' not in lowered:
+        return False
+    return not any(marker in lowered for marker in LOGIN_WINDOW_TITLE_EXCLUDES)
 
 
 def _find_login_window():
@@ -477,7 +500,7 @@ def _find_login_window():
             length = user32.GetWindowTextLengthW(hwnd)
             buffer = ctypes.create_unicode_buffer(length + 2)
             user32.GetWindowTextW(hwnd, buffer, length + 2)
-            if buffer.value in LOGIN_WINDOW_TITLES:
+            if _is_login_window_title(buffer.value):
                 found.append(hwnd)
         return True
 
