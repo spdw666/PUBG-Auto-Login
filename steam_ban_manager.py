@@ -32,9 +32,10 @@ from urllib.request import Request, urlopen
 import ttkbootstrap as ttk
 
 APP_NAME = "Steam 封禁批量查询器"
-APP_VERSION = "3.1.1"
+APP_VERSION = "3.1.2"
 GITHUB_REPOSITORY = "spdw666/PUBG-Auto-Login"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+STEAM_API_KEY_APPLICATION_URL = "https://steamcommunity.com/dev/apikey"
 
 API_URLS = (
     "https://api.steampowered.com/ISteamUser/GetPlayerBans/v1/",
@@ -2049,6 +2050,12 @@ class SteamBanApp:
         style.configure("SectionTitle.TLabel", background=UiColors.SURFACE, foreground=UiColors.TEXT, font=("Microsoft YaHei UI", 11, "bold"))
         style.configure("Body.TLabel", background=UiColors.SURFACE, foreground=UiColors.TEXT, font=("Microsoft YaHei UI", 9))
         style.configure("Hint.TLabel", background=UiColors.SURFACE, foreground=UiColors.MUTED, font=("Microsoft YaHei UI", 9))
+        style.configure(
+            "Link.TLabel",
+            background=UiColors.SURFACE,
+            foreground=UiColors.PRIMARY,
+            font=("Microsoft YaHei UI", 9, "underline"),
+        )
         style.configure("Warning.TLabel", background=UiColors.SURFACE_SUBTLE, foreground=UiColors.WARNING, font=("Microsoft YaHei UI", 9))
         style.configure("Badge.TLabel", background=UiColors.PRIMARY, foreground="#FFFFFF", font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 5))
         style.configure("SuccessBadge.TLabel", background=UiColors.SUCCESS_SUBTLE, foreground=UiColors.SUCCESS, font=("Microsoft YaHei UI", 9, "bold"), padding=(9, 4))
@@ -2117,7 +2124,23 @@ class SteamBanApp:
         self.key_state_label.pack(side="right")
         key_row = ttk.Frame(key_card, style="Card.TFrame")
         key_row.pack(fill="x")
-        ttk.Label(key_row, text="Steam Web API Key", style="Body.TLabel").pack(anchor="w", pady=(0, 6))
+        key_label_row = ttk.Frame(key_row, style="Card.TFrame")
+        key_label_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(key_label_row, text="Steam Web API Key", style="Body.TLabel").pack(side="left")
+        self.api_key_application_link = ttk.Label(
+            key_label_row,
+            text="申请地址：https://steamcommunity.com/dev/apikey（点击打开）",
+            style="Link.TLabel",
+            cursor="hand2",
+        )
+        self.api_key_application_link.pack(side="right")
+        self.api_key_application_link.bind("<Button-1>", self._open_api_key_application_page)
+        self.api_key_application_link.bind("<Return>", self._open_api_key_application_page)
+        ttk.Label(
+            key_row,
+            text="不会申请？登录 Steam → 填写网站域名（个人使用可填 localhost）→ 注册 → 复制 Key 到下方并保存。",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(0, 6))
         self.key_entry = ttk.Entry(key_row, textvariable=self.api_key_var, show="●", width=62, style="Key.TEntry")
         self.key_entry.pack(fill="x")
         key_actions = ttk.Frame(key_card, style="Card.TFrame")
@@ -2304,6 +2327,12 @@ class SteamBanApp:
         self.remember_key_var.set(True)
         self.key_state_var.set("已加密保存")
         self.status_var.set("Steam Web API Key 已使用 Windows 当前用户加密保存。")
+
+    def _open_api_key_application_page(self, _event: Any = None) -> str:
+        """从 Key 输入区直接打开 Steam 官方 Key 申请页。"""
+        webbrowser.open(STEAM_API_KEY_APPLICATION_URL)
+        self.status_var.set("已打开 Steam Web API Key 官方申请页；注册后复制 Key 到输入框并保存。")
+        return "break"
 
     def clear_saved_api_key(self) -> None:
         if not self.api_key_var.get() and not self.key_store.path.exists():
@@ -3154,7 +3183,7 @@ class SteamBanApp:
 
 def run_self_test() -> None:
     assert normalize_steam_id("76561198000000000") == "76561198000000000"
-    assert version_key("v3.1.1") == (3, 1, 1)
+    assert version_key("v3.1.2") == (3, 1, 2)
     assert version_key("3.1") is None
     fixed_now = datetime.strptime("2026-09-22 12:00:00 +0800", "%Y-%m-%d %H:%M:%S %z")
     assert login_elapsed_label("2026-09-20 13:00:00 +0800", "2026-09-20 12:00:00 +0800", fixed_now) == "距上次登录 47 小时"
@@ -3630,6 +3659,19 @@ def run_self_test() -> None:
         assert update_ui_app.update_button.options['text'] == '检查更新'
         assert update_ui_app.update_button.options['state'] == 'normal'
         assert update_ui_app.root.after_calls
+
+        # Key 输入区的官方申请链接必须打开准确地址，并给用户明确的下一步提示。
+        api_key_link_app = SteamBanApp.__new__(SteamBanApp)
+        api_key_link_app.status_var = FakeVar()
+        opened_urls = []
+        saved_browser_open = webbrowser.open
+        try:
+            webbrowser.open = lambda url: opened_urls.append(url) or True
+            assert api_key_link_app._open_api_key_application_page() == "break"
+        finally:
+            webbrowser.open = saved_browser_open
+        assert opened_urls == [STEAM_API_KEY_APPLICATION_URL]
+        assert "复制 Key 到输入框并保存" in api_key_link_app.status_var.get()
 
         # 运行中的登录被拒绝，双击列表或重复点击都不能再启动第二个 Steam 线程。
         login_guard_app = SteamBanApp.__new__(SteamBanApp)
